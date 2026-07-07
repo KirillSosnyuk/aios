@@ -173,6 +173,30 @@ async def call_model_router(user_text: str, chat_id: str) -> str:
             logging.error(f"All models failed: {cloud_err}")
             return "Извини, произошла ошибка соединения с ИИ-модулями."
 
+async def keep_local_model_warm():
+    """Держит локальную модель постоянно загруженной в Ollama.
+
+    Ollama по умолчанию выгружает модель из памяти после ~5 минут простоя
+    (см. вывод `ollama ps`, колонка UNTIL) — а следующий запрос после этого
+    платит временем холодного старта (загрузка весов в VRAM) ПОВЕРХ обычной
+    генерации, что легко выбивает наш timeout=8.0 даже на маленькой модели
+    и на простом сообщении без поиска. Пингуем чаще, чем таймаут простоя,
+    чтобы модель не успевала выгружаться в нормальном режиме работы бота.
+    """
+    while True:
+        await asyncio.sleep(180)  # каждые 3 минуты — с запасом до дефолтных 5 минут Ollama
+        try:
+            await local_client.chat.completions.create(
+                model=PRIMARY_MODEL,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+                timeout=30.0,  # прогрев в фоне, никто его не ждёт — можно не спешить
+            )
+            logging.info("[Kernel] Локальная модель прогрета (keep-alive)")
+        except Exception as e:
+            logging.warning(f"[Kernel] Не удалось прогреть локальную модель: {e}")
+
+
 async def process_event(event_id: str, event_json: str):
     try:
         event_dict = json.loads(event_json)
@@ -201,6 +225,7 @@ async def process_event(event_id: str, event_json: str):
 
 async def main():
     logging.info("AI Kernel started. Listening to stream:ingress...")
+    asyncio.create_task(keep_local_model_warm())
     last_id = '$'
     while True:
         try:

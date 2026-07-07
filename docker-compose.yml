@@ -36,9 +36,11 @@ services:
     environment:
       - REDIS_HOST=redis
       - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+      - CLOUD_API_BASE_URL=${CLOUD_API_BASE_URL}
       - CLOUD_API_KEY=${CLOUD_API_KEY}
       - PRIMARY_MODEL=${PRIMARY_MODEL}
       - FALLBACK_MODEL=${FALLBACK_MODEL}
+      - SEARCH_BACKEND=${SEARCH_BACKEND:-google,brave}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
