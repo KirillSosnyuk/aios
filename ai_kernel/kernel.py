@@ -22,7 +22,7 @@ if "generativelanguage" in CLOUD_API_URL and "openai" not in CLOUD_API_URL:
     CLOUD_API_URL = CLOUD_API_URL.rstrip("/") + "/openai/"
 
 CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "")
-PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "qwen2.5:3b")  # Убедись, что тут qwen2.5:3b
+PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "qwen3:8b")  # Дефолт держим в синхроне с PRIMARY_MODEL из .env
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash") 
 
 redis_client = Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -44,7 +44,7 @@ async def save_chat_message(chat_id: str, role: str, content: str):
     await redis_client.rpush(history_key, json.dumps(message))
     await redis_client.ltrim(history_key, -10, -1)
 
-async def handle_tool_calls(client, model_name, messages, tool_calls):
+async def handle_tool_calls(client, model_name, messages, tool_calls, timeout: float = 15.0):
     """Вспомогательная функция для выполнения инструментов и повторного запроса к модели"""
     # Добавляем ответ модели с требованием вызова инструмента в контекст
     messages.append({
@@ -76,9 +76,12 @@ async def handle_tool_calls(client, model_name, messages, tool_calls):
             })
             
     # Повторный запрос к модели, теперь имея на руках результаты поиска
+    # ВАЖНО: без timeout эта ветка ничем не ограничена — если локалка зависнет
+    # уже после вызова инструмента, фоллбэка на облако по таймауту не будет.
     second_response = await client.chat.completions.create(
         model=model_name,
-        messages=messages
+        messages=messages,
+        timeout=timeout
     )
     return second_response.choices[0].message.content
 
@@ -109,7 +112,7 @@ async def call_model_router(user_text: str, chat_id: str) -> str:
         # Проверяем, хочет ли локальная модель вызвать инструмент
         if response.choices[0].message.tool_calls:
             logging.info(f"[Kernel] Локальная модель запросила вызов инструментов: {response.choices[0].message.tool_calls}")
-            ai_reply = await handle_tool_calls(local_client, PRIMARY_MODEL, messages, response.choices[0].message.tool_calls)
+            ai_reply = await handle_tool_calls(local_client, PRIMARY_MODEL, messages, response.choices[0].message.tool_calls, timeout=8.0)
         else:
             ai_reply = response.choices[0].message.content
             
@@ -134,7 +137,7 @@ async def call_model_router(user_text: str, chat_id: str) -> str:
             
             if response.choices[0].message.tool_calls:
                 logging.info(f"[Kernel] Облако запросило вызов инструментов: {response.choices[0].message.tool_calls}")
-                ai_reply = await handle_tool_calls(cloud_client, FALLBACK_MODEL, cloud_messages, response.choices[0].message.tool_calls)
+                ai_reply = await handle_tool_calls(cloud_client, FALLBACK_MODEL, cloud_messages, response.choices[0].message.tool_calls, timeout=20.0)
             else:
                 ai_reply = response.choices[0].message.content
             
