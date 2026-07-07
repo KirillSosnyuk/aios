@@ -5,6 +5,8 @@ import random
 import time
 from typing import Dict, List, Optional
 
+from memory import set_preference as _set_preference
+
 # --- Импорт поискового движка ---------------------------------------------
 # Пакет `duckduckgo_search` заморожен в июле 2025 и переименован в `ddgs`.
 # Старое имя больше не получает фиксы анти-бот защиты DuckDuckGo и со временем
@@ -124,7 +126,30 @@ async def search_web(query: str) -> str:
     return _format_results(results)
 
 
-# --- JSON-описание инструмента для модели (стандарт OpenAI / Ollama) --------
+async def remember_preference(user_id: Optional[int], category: Optional[str], key: Optional[str], value: Optional[str]) -> str:
+    """Инструмент для модели: сохранить факт/предпочтение о пользователе в
+    Postgres (раздел 14.4 спецификации — Preference Memory), чтобы он был
+    доступен в будущих разговорах, а не только в текущих 10 сообщениях истории.
+
+    Уровень разрешения — 0 (см. TOOL_PERMISSION_LEVELS в kernel.py): по
+    спецификации (18.3) "записать заметку" — безвредное автоматическое
+    действие, подтверждение не требуется.
+    """
+    if not user_id:
+        return "Не удалось сохранить: пользователь не определён."
+    if not category or not key or not value:
+        return "Не удалось сохранить: нужны category, key и value."
+
+    try:
+        await _set_preference(user_id, category, key, value)
+        logger.info("[remember] Сохранено для user_id=%s: %s/%s = %s", user_id, category, key, value)
+        return f"Запомнил: {category}/{key} = {value}."
+    except Exception as e:
+        logger.error("[remember] Не удалось сохранить предпочтение: %s", e)
+        return f"Не удалось сохранить: {e}"
+
+
+# --- JSON-описание инструментов для модели (стандарт OpenAI / Ollama) -------
 TOOLS_MANIFEST = [
     {
         "type": "function",
@@ -150,5 +175,35 @@ TOOLS_MANIFEST = [
                 "required": ["query"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_preference",
+            "description": (
+                "Сохрани важный факт или предпочтение о пользователе на будущее — "
+                "например, диету, любимые бренды, часовой пояс, стиль общения, "
+                "аллергии. Используй, когда пользователь явно сообщает о себе "
+                "что-то, что стоит помнить и в следующих разговорах."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Категория факта, например 'food', 'communication_style', 'schedule', 'health'.",
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Короткий ключ факта, например 'diet' или 'timezone'.",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Значение, например 'вегетарианец' или 'Europe/Moscow'.",
+                    },
+                },
+                "required": ["category", "key", "value"],
+            },
+        },
+    },
 ]

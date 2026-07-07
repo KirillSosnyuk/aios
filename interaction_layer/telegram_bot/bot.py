@@ -41,7 +41,13 @@ async def handle_user_message(message: types.Message):
         payload={
             "chat_id": message.chat.id,
             "text": message.text,
-            "username": message.from_user.username
+            "username": message.from_user.username,
+            # Внутренний users.id в памяти ядра резолвится по telegram_user_id
+            # (см. memory.get_or_create_user) — не по username/chat_id, т.к.
+            # они могут меняться или отсутствовать. display_name — только для
+            # первичного заполнения профиля, дальше не перезаписывается.
+            "telegram_user_id": message.from_user.id,
+            "display_name": message.from_user.full_name,
         },
         severity=EventSeverity.INFO
     )

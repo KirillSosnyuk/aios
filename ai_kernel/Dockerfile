@@ -7,6 +7,8 @@ COPY ai_kernel/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ai_kernel/kernel.py .
+COPY ai_kernel/tools.py .
+COPY ai_kernel/memory.py .
 COPY event_bus/ /app/event_bus/
 
 CMD ["python", "kernel.py"]
