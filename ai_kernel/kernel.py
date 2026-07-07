@@ -57,6 +57,22 @@ DEFAULT_PERMISSION_LEVEL = 1  # для инструментов, не описа
 # реальный запрос подтверждения пользователя.
 MAX_AUTO_PERMISSION_LEVEL = 1
 
+# Локальная модель — быстрый путь. Ограничиваем длину её ответа: во-первых,
+# это напрямую сокращает время генерации (меньше токенов — меньше времени),
+# во-вторых — не даёт ей писать развёрнутые эссе на простые бытовые вопросы
+# (например, 4 рецепта вместо одного совета). Облако намеренно НЕ ограничено —
+# когда до него доходит очередь, пользователь уже готов подождать чуть дольше
+# ради более полного ответа.
+LOCAL_MAX_TOKENS = 400
+LOCAL_BREVITY_SUFFIX = (
+    "\n\nТЫ СЕЙЧАС РАБОТАЕШЬ КАК БЫСТРАЯ ЛОКАЛЬНАЯ МОДЕЛЬ: отвечай МАКСИМАЛЬНО "
+    "КОРОТКО — 2-4 предложения, одна конкретная рекомендация вместо перечисления "
+    "вариантов, без пошаговых рецептов, инструкций и длинных списков. Если тема "
+    "того заслуживает — дай сжатую суть и предложи спросить подробнее, если "
+    "понадобится."
+)
+
+
 async def get_chat_history(chat_id: str) -> list:
     history_key = f"chat_history:{chat_id}"
     history_raw = await redis_client.lrange(history_key, 0, -1)
@@ -69,6 +85,50 @@ async def save_chat_message(chat_id: str, role: str, content: str):
     message = {"role": role, "content": content}
     await redis_client.rpush(history_key, json.dumps(message))
     await redis_client.ltrim(history_key, -10, -1)
+
+
+async def _publish_status(chat_id, trace_id: Optional[str], text: str):
+    """Публикует лёгкое статусное событие (раздел 4 — Explainability): что
+    именно сейчас делает ядро — думает локально, подключает облако, ищет,
+    запоминает и т.п. Interaction layer (bot.py) показывает это как одно
+    редактируемое сообщение, которое исчезает перед финальным ответом.
+
+    Никогда не бросает исключение наружу — статус вспомогательный, не должен
+    иметь возможность сорвать доставку настоящего ответа.
+    """
+    if not chat_id:
+        return
+    try:
+        # trace_id у BaseEvent — обязательный UUID с default_factory=uuid4;
+        # передаём его, только если реально есть (иначе пусть Pydantic сам
+        # сгенерирует новый, а не падает на None).
+        kwargs = {"source": "ai_kernel", "type": EventType.STATUS_UPDATE, "payload": {"chat_id": chat_id, "text": text}}
+        if trace_id:
+            kwargs["trace_id"] = trace_id
+        status_event = BaseEvent(**kwargs)
+        await redis_client.xadd("stream:egress", {"data": status_event.model_dump_json()})
+    except Exception as e:
+        logging.warning(f"[Kernel] Не удалось опубликовать статус: {e}")
+
+
+def _describe_tool_call(tool_call) -> str:
+    """Короткое человекочитаемое описание вызова инструмента для статуса."""
+    name = tool_call.function.name
+    try:
+        args = json.loads(tool_call.function.arguments)
+    except (json.JSONDecodeError, TypeError):
+        args = {}
+
+    if name == "search_web":
+        query = args.get("query")
+        return f"Ищу в интернете: {query}" if query else "Ищу в интернете…"
+    elif name == "remember_preference":
+        n = len(args.get("facts") or [])
+        return f"Запоминаю {n} факт(ов) о тебе…" if n else "Запоминаю факты о тебе…"
+    elif name == "add_memory_note":
+        return "Сохраняю заметку о тебе…"
+    else:
+        return f"Выполняю: {name}…"
 
 
 async def _dispatch_tool_call(tool_call, user_id: Optional[int]) -> str:
@@ -103,6 +163,7 @@ async def handle_tool_calls(
     client, model_name, messages, tool_calls,
     user_id: Optional[int] = None,
     trace_id: Optional[str] = None,
+    chat_id=None,
     timeout: float = 15.0,
     max_rounds: int = 6,
 ):
@@ -117,18 +178,24 @@ async def handle_tool_calls(
 
     Каждый вызов инструмента теперь проходит проверку уровня разрешения
     (раздел 18 спецификации) и пишется в журнал решений (memory.log_decision,
-    раздел 14.8/23), прежде чем реально выполниться.
+    раздел 14.8/23), прежде чем реально выполниться. Перед каждым раундом
+    публикуется статус (chat_id) с кратким описанием того, что вот-вот
+    произойдёт — один статус на раунд, а не на отдельный вызов, чтобы не
+    заваливать Telegram частыми правками одного сообщения.
 
     max_rounds было поднято с 3 до 6: облачная модель (gpt-oss-120b через Groq)
     на длинных "расскажи о себе" сообщениях иногда вызывает remember_preference
     ПО ОДНОМУ факту за раунд вместо пакета за один раз — при 3 раундах и
     богатом сообщении (десяток фактов) лимит исчерпывался раньше, чем модель
-    успевала дать финальный текстовый ответ, и пользователь получал только
-    служебное сообщение о неудаче вместо ответа (при этом часть фактов уже
-    успевала сохраниться — см. system_prompt в call_model_router, где теперь
-    отдельно объяснено, что нужно укладываться в несколько вызовов, а не длинную серию).
+    успевала дать финальный текстовый ответ. remember_preference теперь сам
+    принимает список фактов за один вызов (см. tools.py), что должно резко
+    сократить число раундов на практике — max_rounds=6 остаётся как запас.
     """
     for _ in range(max_rounds):
+        if chat_id:
+            summary = "; ".join(_describe_tool_call(tc) for tc in tool_calls)
+            await _publish_status(chat_id, trace_id, summary)
+
         # Добавляем ответ модели с требованием вызова инструмента в контекст
         messages.append({
             "role": "assistant",
@@ -233,11 +300,12 @@ async def _run_cloud_fallback(
     decision_label = "answered_hybrid_tool_handoff" if reuse_tool_calls else "answered_cloud_fallback"
     try:
         logging.info(f"Using Cloud Model: {FALLBACK_MODEL}")
+        await _publish_status(chat_id, trace_id, f"Подключаю облачную модель ({FALLBACK_MODEL})…")
 
         if reuse_tool_calls:
             ai_reply = await handle_tool_calls(
                 cloud_client, FALLBACK_MODEL, cloud_messages, reuse_tool_calls,
-                user_id=user_id, trace_id=trace_id, timeout=20.0,
+                user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=20.0,
             )
         else:
             response = await cloud_client.chat.completions.create(
@@ -250,7 +318,7 @@ async def _run_cloud_fallback(
                 logging.info(f"[Kernel] Облако запросило вызов инструментов: {response.choices[0].message.tool_calls}")
                 ai_reply = await handle_tool_calls(
                     cloud_client, FALLBACK_MODEL, cloud_messages, response.choices[0].message.tool_calls,
-                    user_id=user_id, trace_id=trace_id, timeout=20.0,
+                    user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=20.0,
                 )
             else:
                 ai_reply = response.choices[0].message.content
@@ -291,6 +359,8 @@ async def call_model_router(
 ) -> str:
     current_date = datetime.now().strftime("%d %B %Y (день недели: %A)")
 
+    await _publish_status(chat_id, trace_id, "Обрабатываю запрос…")
+
     # Разрешаем внутренний user_id по telegram_id (создаёт пользователя при
     # первом обращении). Рассчитано на несколько устройств/каналов на одного
     # человека в будущем (голос/колонка) — все они будут вести к тому же
@@ -320,21 +390,34 @@ async def call_model_router(
         "ВАЖНОЕ ПРАВИЛО ПОИСКА: Если пользователь ищет информацию о мировых событиях, спорте, IT или новостях, "
         "ФОРМУЛИРУЙ ПОИСКОВЫЙ ЗАПРОС (query) НА АНГЛИЙСКОМ ЯЗЫКЕ (например, 'FIFA World Cup 2026 matches July 7'). "
         "Англоязычный поиск выдает более точные данные. "
-        "Получив результаты, переведи их и ответь пользователю на чистом русском языке, не выдумывая фактов.\n"
+        "Получив результаты, переведи их и ответь пользователю на чистом русском языке, не выдумывая фактов. "
+        "ВАЖНОЕ ПРАВИЛО ФОРМАТА: это чат в Telegram (в будущем — ещё и голосовой "
+        "интерфейс), а не документ. НЕ используй markdown-разметку: никаких **, "
+        "##-заголовков, таблиц с |, вложенных списков. Пиши обычным связным "
+        "текстом, как будто говоришь вслух — короткими абзацами. Несколько "
+        "вариантов перечисляй прямо в тексте («во-первых… во-вторых…» или через "
+        "запятую), а не списком или таблицей.\n"
         f"{profile_blurb}"
     )
 
     history = await get_chat_history(chat_id)
     messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_text}]
+    # Локальная модель получает тот же system_prompt плюс отдельное указание
+    # быть краткой (см. LOCAL_BREVITY_SUFFIX) — это НЕ просачивается в облако:
+    # если дело дойдёт до _run_cloud_fallback, туда уходит канонический
+    # `messages` без суффикса, а не local_messages.
+    local_messages = [{"role": "system", "content": system_prompt + LOCAL_BREVITY_SUFFIX}] + history + [{"role": "user", "content": user_text}]
 
     # Попытка 1: Локальная модель — быстрый путь для простых ответов без инструментов.
     try:
         logging.info(f"Using Primary Local Model: {PRIMARY_MODEL}")
+        await _publish_status(chat_id, trace_id, f"Думаю (локальная модель {PRIMARY_MODEL})…")
         response = await local_client.chat.completions.create(
             model=PRIMARY_MODEL,
-            messages=messages,
+            messages=local_messages,
             tools=TOOLS_MANIFEST,  # Передаем описание наших навыков
             timeout=8.0,
+            max_tokens=LOCAL_MAX_TOKENS,
             # Qwen3 — гибридная "thinking"-модель: по умолчанию перед ЛЮБЫМ
             # ответом (даже простым решением "вызвать ли инструмент") генерит
             # видимую цепочку рассуждений, которая ничего не даёт для такой

@@ -15,6 +15,11 @@ class EventType(str, Enum):
     COMMAND_REQUESTED = "CommandRequested"
     SYSTEM_TICK = "SystemTick"
     ERROR_OCCURRED = "ErrorOccurred"
+    # Лёгкое статусное событие для "живого" индикатора хода обработки в
+    # интерфейсе (раздел 4 — Explainability): "думаю локально", "ищу в
+    # интернете" и т.п. Публикуется в тот же stream:egress, что и
+    # COMMAND_REQUESTED — interaction layer различает их по полю type.
+    STATUS_UPDATE = "StatusUpdate"
 
 class BaseEvent(BaseModel):
     # Включаем поддержку работы с типами, если потребуется
