@@ -28,7 +28,12 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash")
 redis_client = Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 logging.basicConfig(level=logging.INFO)
 
-local_client = AsyncOpenAI(base_url=OLLAMA_URL, api_key="ollama")
+# ВАЖНО: у openai-python по умолчанию max_retries=2 — то есть сам SDK молча
+# повторяет зависший запрос ещё 2 раза ПОВЕРХ нашего timeout=8.0, и реальное
+# ожидание перед фоллбэком на облако растягивается до ~24с вместо 8. Локалке
+# ретраить нечего — если она не уложилась в timeout, она не уложится и на
+# повторной попытке, поэтому отключаем ретраи именно для local_client.
+local_client = AsyncOpenAI(base_url=OLLAMA_URL, api_key="ollama", max_retries=0)
 cloud_client = AsyncOpenAI(base_url=CLOUD_API_URL, api_key=CLOUD_API_KEY)
 
 async def get_chat_history(chat_id: str) -> list:
@@ -126,9 +131,18 @@ async def call_model_router(user_text: str, chat_id: str) -> str:
         # Попытка 2: Облако Gemini
         try:
             logging.info(f"Using Cloud Model: {FALLBACK_MODEL}")
-            # Сбрасываем контекст для чистого вызова облака (без следов неудачной локалки)
-            cloud_messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_text}]
-            
+            # Если локалка уже успела вызвать search_web и получить результаты
+            # (в messages появилось tool-сообщение), переиспользуем их вместо
+            # повторного поиска с нуля — иначе тот же самый запрос улетает во
+            # все поисковики второй раз подряд, и это чистая трата времени.
+            already_searched = any(m.get("role") == "tool" for m in messages)
+            if already_searched:
+                logging.info("[Kernel] Локалка уже искала — переиспользую результаты поиска для облака")
+                cloud_messages = messages
+            else:
+                # Сбрасываем контекст для чистого вызова облака (без следов неудачной локалки)
+                cloud_messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_text}]
+
             response = await cloud_client.chat.completions.create(
                 model=FALLBACK_MODEL,
                 messages=cloud_messages,

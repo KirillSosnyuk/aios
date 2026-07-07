@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import random
 import time
 from typing import Dict, List, Optional
@@ -28,6 +29,13 @@ MAX_RESULTS = 5
 MAX_RETRIES = 3
 HTTP_TIMEOUT = 10  # сек на один HTTP-запрос движка
 
+# backend="auto" перебирает до 5-6 движков за один вызов (wikipedia, grokipedia,
+# google, yahoo, brave, startpage, ...), включая нестабильные (startpage часто
+# отдаёт капчу, grokipedia иногда 502) — это и есть основная причина долгого
+# поиска. Явно ограничиваем небольшим набором быстрых и обычно надёжных
+# движков; при необходимости меняется через .env без правки кода.
+SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "google,brave")
+
 
 def _run_search_sync(query: str) -> List[Dict[str, str]]:
     """Блокирующий поиск с ретраями и экспоненциальным backoff.
@@ -41,9 +49,8 @@ def _run_search_sync(query: str) -> List[Dict[str, str]]:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             with DDGS(timeout=HTTP_TIMEOUT) as ddgs:
-                # backend="auto" — метапоиск по всем движкам в случайном порядке
                 results = list(
-                    ddgs.text(query, max_results=MAX_RESULTS, backend="auto")
+                    ddgs.text(query, max_results=MAX_RESULTS, backend=SEARCH_BACKEND)
                 )
             if results:
                 return results
