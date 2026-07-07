@@ -5,7 +5,7 @@ import random
 import time
 from typing import Dict, List, Optional
 
-from memory import set_preference as _set_preference
+from memory import set_preference as _set_preference, add_memory_entry as _add_memory_entry
 
 # --- Импорт поискового движка ---------------------------------------------
 # Пакет `duckduckgo_search` заморожен в июле 2025 и переименован в `ddgs`.
@@ -149,6 +149,37 @@ async def remember_preference(user_id: Optional[int], category: Optional[str], k
         return f"Не удалось сохранить: {e}"
 
 
+async def add_memory_note(user_id: Optional[int], content: Optional[str], category: str = "episodic") -> str:
+    """Инструмент для модели: сохранить свободную заметку о пользователе,
+    которая плохо сводится к одной паре категория/ключ/значение (раздел 14.2
+    спецификации — Episodic Memory).
+
+    Дополняет remember_preference: тот — для чётких фактов вида ключ/значение,
+    этот — для более развёрнутого контекста (интересы с деталями, привычки,
+    история), который иначе терялся бы, если модель не смогла (или не
+    попыталась) разложить его на пары ключ-значение. На практике маленькая
+    локальная модель при длинном рассказе о себе часто сохраняет 1-2 самых
+    очевидных факта через remember_preference и пропускает остальное — этот
+    инструмент даёт ей более простой путь не потерять то, что не раскладывается
+    аккуратно на categoty/key/value.
+
+    Уровень разрешения — 0, как и у remember_preference: безвредная запись,
+    подтверждение не требуется (см. TOOL_PERMISSION_LEVELS в kernel.py).
+    """
+    if not user_id:
+        return "Не удалось сохранить: пользователь не определён."
+    if not content or not content.strip():
+        return "Не удалось сохранить: пустая заметка."
+
+    try:
+        await _add_memory_entry(user_id, content.strip(), category=category or "episodic", source="model_noted")
+        logger.info("[remember] Заметка сохранена для user_id=%s (%s): %s", user_id, category, content[:80])
+        return "Заметка сохранена."
+    except Exception as e:
+        logger.error("[remember] Не удалось сохранить заметку: %s", e)
+        return f"Не удалось сохранить заметку: {e}"
+
+
 # --- JSON-описание инструментов для модели (стандарт OpenAI / Ollama) -------
 TOOLS_MANIFEST = [
     {
@@ -203,6 +234,41 @@ TOOLS_MANIFEST = [
                     },
                 },
                 "required": ["category", "key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_memory_note",
+            "description": (
+                "Сохрани свободную заметку о пользователе, которая плохо "
+                "сводится к одной паре категория/ключ/значение — например, "
+                "увлечение с деталями, привычку, контекст из разговора. "
+                "Используй ВМЕСТЕ с remember_preference: если пользователь "
+                "делится сразу несколькими фактами о себе (например, "
+                "представляется или описывает свои интересы), вызови "
+                "remember_preference для каждого чёткого факта (профессия, "
+                "город, язык и т.п.) И add_memory_note для остального "
+                "контекста, который не хочется терять."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Текст заметки на русском, например: 'Смотрит "
+                            "киберспорт CS2, tier 1 турниры (PGL, BLAST, ESL), "
+                            "топ-10 команд, вместе с женой.'"
+                        ),
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Необязательная категория заметки, например 'interests', 'habits', 'background'. По умолчанию 'episodic'.",
+                    },
+                },
+                "required": ["content"],
             },
         },
     },

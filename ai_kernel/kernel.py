@@ -7,7 +7,7 @@ from redis.asyncio import Redis
 from openai import AsyncOpenAI, RateLimitError
 
 from event_bus.schemas import BaseEvent, EventType, EventSeverity
-from tools import search_web, remember_preference, TOOLS_MANIFEST  # Импортируем наши инструменты
+from tools import search_web, remember_preference, add_memory_note, TOOLS_MANIFEST  # Импортируем наши инструменты
 import memory  # Слой памяти/профиля (раздел 14 спецификации)
 
 from datetime import datetime
@@ -44,7 +44,8 @@ cloud_client = AsyncOpenAI(base_url=CLOUD_API_URL, api_key=CLOUD_API_KEY)
 # Postgres без изменения вызывающего кода (сигнатура останется той же).
 TOOL_PERMISSION_LEVELS = {
     "search_web": 0,           # только чтение, без побочных эффектов
-    "remember_preference": 0,  # запись заметки о пользователе — безвредно (18.3)
+    "remember_preference": 0,  # запись факта о пользователе — безвредно (18.3)
+    "add_memory_note": 0,      # запись свободной заметки — тоже безвредно
 }
 DEFAULT_PERMISSION_LEVEL = 1  # для инструментов, не описанных явно выше
 
@@ -92,6 +93,12 @@ async def _dispatch_tool_call(tool_call, user_id: Optional[int]) -> str:
             arguments.get("category"),
             arguments.get("key"),
             arguments.get("value"),
+        ))
+    elif name == "add_memory_note":
+        return str(await add_memory_note(
+            user_id,
+            arguments.get("content"),
+            arguments.get("category", "episodic"),
         ))
     else:
         return f"Инструмент '{name}' не существует."
@@ -202,8 +209,16 @@ async def call_model_router(
 
     system_prompt = (
         f"Ты — полезный ИИ-ассистент ядра AIOS. Текущая дата: {current_date}. "
-        "У тебя есть доступ к интернету через инструмент search_web, а также "
-        "можешь сохранить важный факт о пользователе через remember_preference. "
+        "У тебя есть доступ к интернету через инструмент search_web, а также два "
+        "инструмента памяти: remember_preference — для чётких фактов вида "
+        "категория/ключ/значение (профессия, город, диета, часовой пояс, язык), "
+        "и add_memory_note — для более развёрнутого контекста, который не "
+        "сводится к одной паре (интересы с деталями, привычки, история). "
+        "ВАЖНОЕ ПРАВИЛО ПАМЯТИ: если пользователь сообщает о себе НЕСКОЛЬКО "
+        "фактов за раз (представляется, описывает увлечения, просит что-то "
+        "запомнить) — сохрани КАЖДЫЙ отдельный факт, вызвав remember_preference "
+        "и/или add_memory_note столько раз, сколько нужно, а не только один-два "
+        "самых заметных. Лучше сохранить с запасом, чем упустить важную деталь. "
         "ВАЖНОЕ ПРАВИЛО ПОИСКА: Если пользователь ищет информацию о мировых событиях, спорте, IT или новостях, "
         "ФОРМУЛИРУЙ ПОИСКОВЫЙ ЗАПРОС (query) НА АНГЛИЙСКОМ ЯЗЫКЕ (например, 'FIFA World Cup 2026 matches July 7'). "
         "Англоязычный поиск выдает более точные данные. "
