@@ -24,7 +24,7 @@ if "generativelanguage" in CLOUD_API_URL and "openai" not in CLOUD_API_URL:
     CLOUD_API_URL = CLOUD_API_URL.rstrip("/") + "/openai/"
 
 CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "")
-PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "qwen2.5:3b")  # Дефолт держим в синхроне с PRIMARY_MODEL из .env
+PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "qwen3:8b")  # Дефолт держим в синхроне с PRIMARY_MODEL из .env
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash")
 
 redis_client = Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -203,6 +203,90 @@ async def handle_tool_calls(
     # т.к. до лимита раундов может довести любой инструмент, не только поиск.
     return "Не получилось собрать окончательный ответ за разумное число шагов — попробуй переформулировать запрос или отправить его покороче."
 
+
+async def _run_cloud_fallback(
+    cloud_messages: list,
+    user_text: str,
+    chat_id: str,
+    user_id: Optional[int],
+    trace_id: Optional[str],
+    reuse_tool_calls=None,
+):
+    """Единая точка облачного пути. Вызывается в двух случаях: (1) локальная
+    модель вообще не ответила (таймаут/ошибка), (2) локальная модель ответила
+    и запросила инструмент, но саму оркестровку (выполнение + возможные
+    доп. раунды + связный финальный ответ) сразу отдаём облаку, не давая
+    локалке тянуть это самой.
+
+    Это ключевое изменение по итогам критического разбора от 2026-07-08:
+    маленькая локальная модель регулярно не справлялась именно с
+    многораундовой работой инструментов (таймауты на втором шаге, недо-
+    извлечённые факты из длинных сообщений) — а не с самим решением, какой
+    инструмент вызвать. Раньше локалка сама пыталась это оркестровать и либо
+    таймаутилась (тратя впустую свои 8 секунд), либо путала половину фактов;
+    теперь эта работа только у облака, а локалка отвечает за две вещи: свои
+    собственные быстрые ответы без инструментов и (дёшево) выбор нужного
+    инструмента.
+
+    reuse_tool_calls: если передан — решение "что вызвать" уже принято (обычно
+    локальной моделью), и мы не тратим время на то, чтобы облако решало ту же
+    задачу с нуля — сразу выполняем и продолжаем диалог с этой же историей
+    сообщений (она ещё не содержит следов локального вызова — локалка теперь
+    никогда сама не выполняет handle_tool_calls, так что messages здесь всегда
+    "чистый" [system, история, user], без риска рассинхрона).
+    """
+    decision_label = "answered_hybrid_tool_handoff" if reuse_tool_calls else "answered_cloud_fallback"
+    try:
+        logging.info(f"Using Cloud Model: {FALLBACK_MODEL}")
+
+        if reuse_tool_calls:
+            ai_reply = await handle_tool_calls(
+                cloud_client, FALLBACK_MODEL, cloud_messages, reuse_tool_calls,
+                user_id=user_id, trace_id=trace_id, timeout=20.0,
+            )
+        else:
+            response = await cloud_client.chat.completions.create(
+                model=FALLBACK_MODEL,
+                messages=cloud_messages,
+                tools=TOOLS_MANIFEST,  # Передаем плагины и в облако тоже!
+            )
+
+            if response.choices[0].message.tool_calls:
+                logging.info(f"[Kernel] Облако запросило вызов инструментов: {response.choices[0].message.tool_calls}")
+                ai_reply = await handle_tool_calls(
+                    cloud_client, FALLBACK_MODEL, cloud_messages, response.choices[0].message.tool_calls,
+                    user_id=user_id, trace_id=trace_id, timeout=20.0,
+                )
+            else:
+                ai_reply = response.choices[0].message.content
+
+        await save_chat_message(chat_id, "user", user_text)
+        await save_chat_message(chat_id, "assistant", ai_reply)
+        await memory.log_decision(trace_id, user_id, decision_label, model_used=FALLBACK_MODEL)
+        return ai_reply
+
+    except RateLimitError as cloud_err:
+        # Отдельно от прочих ошибок: это не "не достучались", а упёрлись в
+        # квоту/лимит запросов облачного провайдера. Ретраить бессмысленно —
+        # квота не появится за секунды.
+        logging.error(f"Cloud model rate-limited or quota exceeded: {cloud_err}")
+        await memory.log_decision(
+            trace_id, user_id, "cloud_rate_limited",
+            model_used=FALLBACK_MODEL, details={"error": str(cloud_err)},
+        )
+        return (
+            f"ИИ временно недоступен: облачная модель ({FALLBACK_MODEL}) упёрлась в лимит "
+            "запросов. Попробуй чуть позже — лимит обычно сбрасывается в течение суток."
+        )
+    except Exception as cloud_err:
+        logging.error(f"All models failed: {cloud_err}")
+        await memory.log_decision(
+            trace_id, user_id, "all_models_failed",
+            details={"error": str(cloud_err)},
+        )
+        return "Извини, произошла ошибка соединения с ИИ-модулями."
+
+
 async def call_model_router(
     user_text: str,
     chat_id: str,
@@ -247,26 +331,33 @@ async def call_model_router(
     history = await get_chat_history(chat_id)
     messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_text}]
 
-    # Попытка 1: Локальная модель
+    # Попытка 1: Локальная модель — быстрый путь для простых ответов без инструментов.
     try:
         logging.info(f"Using Primary Local Model: {PRIMARY_MODEL}")
         response = await local_client.chat.completions.create(
             model=PRIMARY_MODEL,
             messages=messages,
             tools=TOOLS_MANIFEST,  # Передаем описание наших навыков
-            timeout=8.0  # Чуть увеличили таймаут для 2-этапной генерации локалки
+            timeout=8.0
         )
 
-        # Проверяем, хочет ли локальная модель вызвать инструмент
         if response.choices[0].message.tool_calls:
-            logging.info(f"[Kernel] Локальная модель запросила вызов инструментов: {response.choices[0].message.tool_calls}")
-            ai_reply = await handle_tool_calls(
-                local_client, PRIMARY_MODEL, messages, response.choices[0].message.tool_calls,
-                user_id=user_id, trace_id=trace_id, timeout=8.0,
+            # Локалка неплохо угадывает, КАКОЙ инструмент нужен — это дёшево
+            # и быстро. А вот многораундовую оркестровку (выполнить, решить,
+            # нужен ли ещё шаг, связно ответить) отдаём облаку сразу, не давая
+            # локалке тонуть в этом самой — именно здесь, а не в выборе
+            # инструмента, она регулярно не успевала или недобирала результат.
+            logging.info(
+                f"[Kernel] Локальная модель запросила инструмент(ы) "
+                f"{[tc.function.name for tc in response.choices[0].message.tool_calls]} — "
+                f"передаю оркестровку сразу облаку ({FALLBACK_MODEL})"
             )
-        else:
-            ai_reply = response.choices[0].message.content
+            return await _run_cloud_fallback(
+                messages, user_text, chat_id, user_id, trace_id,
+                reuse_tool_calls=response.choices[0].message.tool_calls,
+            )
 
+        ai_reply = response.choices[0].message.content
         await save_chat_message(chat_id, "user", user_text)
         await save_chat_message(chat_id, "assistant", ai_reply)
         await memory.log_decision(trace_id, user_id, "answered_local", model_used=PRIMARY_MODEL)
@@ -274,63 +365,7 @@ async def call_model_router(
 
     except Exception as e:
         logging.warning(f"Local model skipped, slow or failed: {e}. Routing to Cloud API...")
-
-        # Попытка 2: Облачный фоллбэк (провайдер настраивается через .env — см. FALLBACK_MODEL/CLOUD_API_*)
-        try:
-            logging.info(f"Using Cloud Model: {FALLBACK_MODEL}")
-            # Если локалка уже успела вызвать инструмент и получить результат
-            # (в messages появилось tool-сообщение), переиспользуем их вместо
-            # повторного вызова с нуля — иначе тот же самый запрос улетает
-            # (например, во все поисковики) второй раз подряд, и это чистая
-            # трата времени.
-            already_searched = any(m.get("role") == "tool" for m in messages)
-            if already_searched:
-                logging.info("[Kernel] Локалка уже вызывала инструмент — переиспользую результат для облака")
-                cloud_messages = messages
-            else:
-                # Сбрасываем контекст для чистого вызова облака (без следов неудачной локалки)
-                cloud_messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_text}]
-
-            response = await cloud_client.chat.completions.create(
-                model=FALLBACK_MODEL,
-                messages=cloud_messages,
-                tools=TOOLS_MANIFEST  # Передаем плагины и в облако тоже!
-            )
-
-            if response.choices[0].message.tool_calls:
-                logging.info(f"[Kernel] Облако запросило вызов инструментов: {response.choices[0].message.tool_calls}")
-                ai_reply = await handle_tool_calls(
-                    cloud_client, FALLBACK_MODEL, cloud_messages, response.choices[0].message.tool_calls,
-                    user_id=user_id, trace_id=trace_id, timeout=20.0,
-                )
-            else:
-                ai_reply = response.choices[0].message.content
-
-            await save_chat_message(chat_id, "user", user_text)
-            await save_chat_message(chat_id, "assistant", ai_reply)
-            await memory.log_decision(trace_id, user_id, "answered_cloud_fallback", model_used=FALLBACK_MODEL)
-            return ai_reply
-
-        except RateLimitError as cloud_err:
-            # Отдельно от прочих ошибок: это не "не достучались", а упёрлись в
-            # квоту/лимит запросов облачного провайдера. Ретраить бессмысленно —
-            # квота не появится за секунды.
-            logging.error(f"Cloud model rate-limited or quota exceeded: {cloud_err}")
-            await memory.log_decision(
-                trace_id, user_id, "cloud_rate_limited",
-                model_used=FALLBACK_MODEL, details={"error": str(cloud_err)},
-            )
-            return (
-                f"ИИ временно недоступен: облачная модель ({FALLBACK_MODEL}) упёрлась в лимит "
-                "запросов. Попробуй чуть позже — лимит обычно сбрасывается в течение суток."
-            )
-        except Exception as cloud_err:
-            logging.error(f"All models failed: {cloud_err}")
-            await memory.log_decision(
-                trace_id, user_id, "all_models_failed",
-                details={"error": str(cloud_err)},
-            )
-            return "Извини, произошла ошибка соединения с ИИ-модулями."
+        return await _run_cloud_fallback(messages, user_text, chat_id, user_id, trace_id)
 
 async def keep_local_model_warm():
     """Держит локальную модель постоянно загруженной в Ollama.
