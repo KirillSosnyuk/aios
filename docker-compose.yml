@@ -1,0 +1,79 @@
+services:
+  # Event Bus (Раздел 12)
+  redis:
+    image: redis:7.2-alpine
+    container_name: aios_event_bus
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - aios_network
+
+  # Хранилище сущностей Модели Мира (Раздел 22)
+  postgres:
+    image: postgres:16-alpine
+    container_name: aios_world_model_db
+    environment:
+      POSTGRES_USER: ${DB_USER:-aios_admin}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-aios_secure_pass}
+      POSTGRES_DB: ${DB_NAME:-aios_world_model}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - aios_network
+
+  # Ядро координации (Раздел 13)
+  ai_kernel:
+    build:
+      context: .                  # Контекст теперь — корень проекта
+      dockerfile: ./ai_kernel/Dockerfile # Путь к Докерфайлу
+    container_name: aios_kernel
+    restart: always
+    environment:
+      - REDIS_HOST=redis
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+      - CLOUD_API_KEY=${CLOUD_API_KEY}
+      - PRIMARY_MODEL=${PRIMARY_MODEL}
+      - FALLBACK_MODEL=${FALLBACK_MODEL}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 1. Монтируем папку ядра
+      - ./ai_kernel:/app
+      # 2. Дозакидываем общую шину событий, чтобы локальный синк её не затирал
+      - ./event_bus:/app/event_bus
+    depends_on:
+      - redis
+    networks:
+      - aios_network
+
+  # Interaction Layer: Telegram (Раздел 7)
+  telegram_bot:
+    build:
+      context: .                  # Контекст теперь — корень проекта
+      dockerfile: ./interaction_layer/telegram_bot/Dockerfile
+    container_name: aios_tg_bot
+    restart: always
+    environment:
+      - REDIS_HOST=redis
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ALLOWED_USERS=${ALLOWED_USERS}
+    volumes:
+      - ./interaction_layer/telegram_bot:/app
+      - ./event_bus:/app/event_bus
+    depends_on:
+      - redis
+    networks:
+      - aios_network
+
+volumes:
+  redis_data:
+  postgres_data:
+
+networks:
+  aios_network:
+    driver: bridge
