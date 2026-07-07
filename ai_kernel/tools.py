@@ -126,10 +126,19 @@ async def search_web(query: str) -> str:
     return _format_results(results)
 
 
-async def remember_preference(user_id: Optional[int], category: Optional[str], key: Optional[str], value: Optional[str]) -> str:
-    """Инструмент для модели: сохранить факт/предпочтение о пользователе в
-    Postgres (раздел 14.4 спецификации — Preference Memory), чтобы он был
-    доступен в будущих разговорах, а не только в текущих 10 сообщениях истории.
+async def remember_preference(user_id: Optional[int], facts: Optional[list]) -> str:
+    """Инструмент для модели: сохранить ОДИН ИЛИ НЕСКОЛЬКО фактов/предпочтений
+    о пользователе в Postgres ЗА ОДИН ВЫЗОВ (раздел 14.4 спецификации —
+    Preference Memory), чтобы они были доступны в будущих разговорах.
+
+    facts — список объектов {category, key, value}. Раньше инструмент принимал
+    ровно один факт за вызов, и на длинных "расскажи о себе" сообщениях модели
+    (особенно облачная, gpt-oss-120b через Groq) вызывали его ПО ОДНОМУ факту
+    за раунд — при десятке фактов это упиралось в лимит раундов handle_tool_calls
+    и в лимиты Groq раньше, чем модель успевала дать финальный ответ (см.
+    критический разбор от 2026-07-08). Теперь форма вызова ровно одна — список,
+    даже для одного факта — так у модели нет соблазна звать инструмент много
+    раз подряд вместо одного пакетного вызова.
 
     Уровень разрешения — 0 (см. TOOL_PERMISSION_LEVELS в kernel.py): по
     спецификации (18.3) "записать заметку" — безвредное автоматическое
@@ -137,16 +146,32 @@ async def remember_preference(user_id: Optional[int], category: Optional[str], k
     """
     if not user_id:
         return "Не удалось сохранить: пользователь не определён."
-    if not category or not key or not value:
-        return "Не удалось сохранить: нужны category, key и value."
+    if not facts or not isinstance(facts, list):
+        return "Не удалось сохранить: нужен непустой список facts (category/key/value)."
 
-    try:
-        await _set_preference(user_id, category, key, value)
-        logger.info("[remember] Сохранено для user_id=%s: %s/%s = %s", user_id, category, key, value)
-        return f"Запомнил: {category}/{key} = {value}."
-    except Exception as e:
-        logger.error("[remember] Не удалось сохранить предпочтение: %s", e)
-        return f"Не удалось сохранить: {e}"
+    saved, errors = [], []
+    for fact in facts:
+        fact = fact or {}
+        category, key, value = fact.get("category"), fact.get("key"), fact.get("value")
+        if not category or not key or not value:
+            errors.append(str(fact))
+            continue
+        try:
+            await _set_preference(user_id, category, key, value)
+            saved.append(f"{category}/{key} = {value}")
+        except Exception as e:
+            logger.error("[remember] Не удалось сохранить %s/%s: %s", category, key, e)
+            errors.append(f"{category}/{key} ({e})")
+
+    if saved:
+        logger.info("[remember] Сохранено для user_id=%s (%d шт.): %s", user_id, len(saved), "; ".join(saved))
+
+    parts = []
+    if saved:
+        parts.append(f"Запомнил {len(saved)}: " + "; ".join(saved) + ".")
+    if errors:
+        parts.append(f"Не удалось сохранить {len(errors)}: " + "; ".join(errors) + ".")
+    return " ".join(parts) if parts else "Не удалось сохранить: пустой список фактов."
 
 
 async def add_memory_note(user_id: Optional[int], content: Optional[str], category: str = "episodic") -> str:
@@ -212,28 +237,42 @@ TOOLS_MANIFEST = [
         "function": {
             "name": "remember_preference",
             "description": (
-                "Сохрани важный факт или предпочтение о пользователе на будущее — "
-                "например, диету, любимые бренды, часовой пояс, стиль общения, "
-                "аллергии. Используй, когда пользователь явно сообщает о себе "
-                "что-то, что стоит помнить и в следующих разговорах."
+                "Сохрани один или несколько чётких фактов/предпочтений о "
+                "пользователе на будущее — профессия, город, диета, часовой "
+                "пояс, язык, любимые бренды, аллергии и т.п. ВАЖНО: если "
+                "фактов несколько (например, пользователь представляется и "
+                "называет сразу много деталей о себе) — передай их ВСЕ СРАЗУ "
+                "одним вызовом, перечислив в facts, а НЕ отдельными вызовами "
+                "по одному факту. Один вызов с 5 фактами быстрее и надёжнее "
+                "пяти вызовов по одному."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "category": {
-                        "type": "string",
-                        "description": "Категория факта, например 'food', 'communication_style', 'schedule', 'health'.",
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "Короткий ключ факта, например 'diet' или 'timezone'.",
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "Значение, например 'вегетарианец' или 'Europe/Moscow'.",
+                    "facts": {
+                        "type": "array",
+                        "description": "Список фактов для сохранения за один вызов (даже для одного факта — список из одного элемента).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "category": {
+                                    "type": "string",
+                                    "description": "Категория факта, например 'food', 'communication_style', 'schedule', 'health'.",
+                                },
+                                "key": {
+                                    "type": "string",
+                                    "description": "Короткий ключ факта, например 'diet' или 'timezone'.",
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "Значение, например 'вегетарианец' или 'Europe/Moscow'.",
+                                },
+                            },
+                            "required": ["category", "key", "value"],
+                        },
                     },
                 },
-                "required": ["category", "key", "value"],
+                "required": ["facts"],
             },
         },
     },
@@ -248,9 +287,9 @@ TOOLS_MANIFEST = [
                 "Используй ВМЕСТЕ с remember_preference: если пользователь "
                 "делится сразу несколькими фактами о себе (например, "
                 "представляется или описывает свои интересы), вызови "
-                "remember_preference для каждого чёткого факта (профессия, "
-                "город, язык и т.п.) И add_memory_note для остального "
-                "контекста, который не хочется терять."
+                "remember_preference ОДИН раз со всеми чёткими фактами "
+                "(профессия, город, язык и т.п.) И add_memory_note для "
+                "остального контекста, который не хочется терять."
             ),
             "parameters": {
                 "type": "object",
