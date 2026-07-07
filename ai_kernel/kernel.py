@@ -3,7 +3,7 @@ import logging
 import os
 import json
 from redis.asyncio import Redis
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 
 from event_bus.schemas import BaseEvent, EventType, EventSeverity
 from tools import search_web, TOOLS_MANIFEST  # Импортируем наш поиск
@@ -22,7 +22,7 @@ if "generativelanguage" in CLOUD_API_URL and "openai" not in CLOUD_API_URL:
     CLOUD_API_URL = CLOUD_API_URL.rstrip("/") + "/openai/"
 
 CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "")
-PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "qwen3:8b")  # Дефолт держим в синхроне с PRIMARY_MODEL из .env
+PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "qwen2.5:3b")  # Дефолт держим в синхроне с PRIMARY_MODEL из .env
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash") 
 
 redis_client = Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -159,6 +159,16 @@ async def call_model_router(user_text: str, chat_id: str) -> str:
             await save_chat_message(chat_id, "assistant", ai_reply)
             return ai_reply
             
+        except RateLimitError as cloud_err:
+            # Отдельно от прочих ошибок: это не "не достучались", а упёрлись в
+            # квоту/лимит запросов Gemini API (бесплатный тариф это позволяет
+            # нечасто). Ретраить бессмысленно — квота не появится за секунды.
+            logging.error(f"Cloud model rate-limited or quota exceeded: {cloud_err}")
+            return (
+                "ИИ временно недоступен: облачная модель Gemini упёрлась в лимит "
+                "запросов бесплатного тарифа. Попробуй чуть позже — лимит "
+                "сбрасывается в течение суток."
+            )
         except Exception as cloud_err:
             logging.error(f"All models failed: {cloud_err}")
             return "Извини, произошла ошибка соединения с ИИ-модулями."
