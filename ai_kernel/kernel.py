@@ -49,46 +49,79 @@ async def save_chat_message(chat_id: str, role: str, content: str):
     await redis_client.rpush(history_key, json.dumps(message))
     await redis_client.ltrim(history_key, -10, -1)
 
-async def handle_tool_calls(client, model_name, messages, tool_calls, timeout: float = 15.0):
-    """Вспомогательная функция для выполнения инструментов и повторного запроса к модели"""
-    # Добавляем ответ модели с требованием вызова инструмента в контекст
-    messages.append({
-        "role": "assistant",
-        "content": "",  # <--- ИСПРАВЛЕНИЕ: Ollama требует, чтобы это поле не было пустым (nil)
-        "tool_calls": [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments}
-            } for tc in tool_calls
-        ]
-    })
-    
-    for tool_call in tool_calls:
-        if tool_call.function.name == "search_web":
-            arguments = json.loads(tool_call.function.arguments)
-            query = arguments.get("query")
-            
-            # Вызываем наш реальный Python-скрипт поиска
-            search_result = await search_web(query)
-            
-            # Отправляем результат обратно модели
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "name": "search_web",
-                "content": str(search_result) # На всякий случай жестко приводим к строке
-            })
-            
-    # Повторный запрос к модели, теперь имея на руках результаты поиска
-    # ВАЖНО: без timeout эта ветка ничем не ограничена — если локалка зависнет
-    # уже после вызова инструмента, фоллбэка на облако по таймауту не будет.
-    second_response = await client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        timeout=timeout
-    )
-    return second_response.choices[0].message.content
+async def handle_tool_calls(client, model_name, messages, tool_calls, timeout: float = 15.0, max_rounds: int = 3):
+    """Выполняет вызовы инструментов и опрашивает модель дальше, пока она не
+    даст обычный текстовый ответ (или не кончится лимит раундов max_rounds).
+
+    Раньше делался только ОДИН раунд, и повторный запрос уходил без tools= —
+    из-за этого некоторые модели (например, gpt-oss-120b через Groq), которые
+    на дозаправленном контексте иногда хотят вызвать инструмент ещё раз
+    (например, доуточнить поиск), получали жёсткий 400 Bad Request
+    ('Tool choice is none, but model called a tool') вместо обычного ответа.
+    """
+    for _ in range(max_rounds):
+        # Добавляем ответ модели с требованием вызова инструмента в контекст
+        messages.append({
+            "role": "assistant",
+            "content": "",  # <--- ИСПРАВЛЕНИЕ: Ollama требует, чтобы это поле не было пустым (nil)
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                } for tc in tool_calls
+            ]
+        })
+
+        for tool_call in tool_calls:
+            if tool_call.function.name == "search_web":
+                try:
+                    arguments = json.loads(tool_call.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
+                query = arguments.get("query")
+
+                # Вызываем наш реальный Python-скрипт поиска
+                search_result = await search_web(query)
+
+                # Отправляем результат обратно модели
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": "search_web",
+                    "content": str(search_result) # На всякий случай жестко приводим к строке
+                })
+            else:
+                # Неизвестный/искажённый вызов инструмента (модель иногда
+                # такое галлюцинирует). Каждому tool_call обязательно нужен
+                # ответный "tool"-message с тем же id — иначе следующий запрос
+                # к API упадёт из-за рассинхрона истории сообщений.
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "content": f"Инструмент '{tool_call.function.name}' не существует.",
+                })
+
+        # Повторный запрос к модели, теперь имея на руках результаты поиска.
+        # ВАЖНО: tools= передаём и здесь — иначе модель, которая захочет
+        # поискать ещё раз, упрётся в ошибку вместо обычного ответа.
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            tools=TOOLS_MANIFEST,
+            timeout=timeout
+        )
+
+        if response.choices[0].message.tool_calls:
+            tool_calls = response.choices[0].message.tool_calls
+            continue  # модель просит ещё один раунд поиска
+
+        return response.choices[0].message.content
+
+    # Лимит раундов исчерпан, а модель всё ещё пытается вызывать инструменты —
+    # не зависаем и не падаем, отдаём понятное сообщение вместо ошибки.
+    return "Не получилось собрать окончательный ответ за разумное число шагов поиска — попробуй переформулировать вопрос."
 
 async def call_model_router(user_text: str, chat_id: str) -> str:
     current_date = datetime.now().strftime("%d %B %Y (день недели: %A)")
@@ -184,7 +217,6 @@ async def keep_local_model_warm():
     чтобы модель не успевала выгружаться в нормальном режиме работы бота.
     """
     while True:
-        await asyncio.sleep(180)  # каждые 3 минуты — с запасом до дефолтных 5 минут Ollama
         try:
             await local_client.chat.completions.create(
                 model=PRIMARY_MODEL,
@@ -195,6 +227,10 @@ async def keep_local_model_warm():
             logging.info("[Kernel] Локальная модель прогрета (keep-alive)")
         except Exception as e:
             logging.warning(f"[Kernel] Не удалось прогреть локальную модель: {e}")
+        # Пингуем СРАЗУ при старте (закрывает холодный старт сразу после
+        # docker compose up), а затем каждые 3 минуты — с запасом до
+        # дефолтных 5 минут простоя, после которых Ollama выгружает модель.
+        await asyncio.sleep(180)
 
 
 async def process_event(event_id: str, event_json: str):
