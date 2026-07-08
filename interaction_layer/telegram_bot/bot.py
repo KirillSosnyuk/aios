@@ -180,7 +180,17 @@ async def listen_egress_stream():
                         event_data = json.loads(msg_data["data"])
                         event_type = event_data.get("type")
                         payload = event_data.get("payload", {})
-                        chat_id = payload.get("chat_id")
+                        # str(...) — защитная нормализация типа. Раньше STATUS_UPDATE
+                        # и COMMAND_REQUESTED иногда несли chat_id разных типов
+                        # (str из ядра для статусов, "голый" int для финального
+                        # ответа) — _status_state хранится по chat_id как ключу
+                        # словаря, а int(123) и str("123") в Python это разные
+                        # ключи. Из-за этого статус прошлого запроса не находился
+                        # для удаления и следующий запрос редактировал чужое
+                        # сообщение. Приводим к строке здесь ещё раз на всякий
+                        # случай, независимо от того, что именно прислало ядро.
+                        raw_chat_id = payload.get("chat_id")
+                        chat_id = str(raw_chat_id) if raw_chat_id is not None else None
 
                         if event_type == EventType.STATUS_UPDATE:
                             await _show_status(chat_id, payload.get("text"))
