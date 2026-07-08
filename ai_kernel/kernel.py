@@ -64,6 +64,20 @@ DEFAULT_PERMISSION_LEVEL = 1  # для инструментов, не описа
 # реальный запрос подтверждения пользователя.
 MAX_AUTO_PERMISSION_LEVEL = 1
 
+# Жёсткий потолок на обработку ОДНОГО сообщения целиком (раздел 13 —
+# устойчивость AI Kernel). main() — единственный последовательный consumer
+# stream:ingress: пока process_event() не завершится, ядро физически не
+# может взять следующее сообщение — ни от этого пользователя, ни от других
+# двух. Если call_model_router где-то зависнет БЕЗ исключения (например,
+# 2026-07-08: pool.acquire() у asyncpg без timeout мог ждать освобождения
+# соединения вечно — try/except его не ловит, потому что это не исключение,
+# а обычное ожидание) — раньше это останавливало бота целиком без единой
+# строчки в логах. Теперь такой сценарий гарантированно обрывается по
+# таймауту, и ядро возвращается к очереди, а не подвисает навсегда.
+# 150 секунд — с запасом под легитимный случай (LOCAL_TIMEOUT=25 + до 6
+# раундов инструментов по timeout=20 каждый на облаке), но не бесконечность.
+PROCESS_HARD_DEADLINE = 150.0
+
 # Локальная модель — быстрый путь. Ограничиваем длину её ответа: во-первых,
 # это напрямую сокращает время генерации (меньше токенов — меньше времени),
 # во-вторых — не даёт ей писать развёрнутые эссе на простые бытовые вопросы
@@ -516,12 +530,30 @@ async def process_event(event_id: str, event_json: str):
             display_name = event.payload.get("display_name")
             logging.info(f"Processing message from chat {chat_id}: '{user_text}'")
 
-            ai_response = await call_model_router(
-                user_text, str(chat_id),
-                telegram_user_id=telegram_user_id,
-                display_name=display_name,
-                trace_id=str(event.trace_id),
-            )
+            try:
+                ai_response = await asyncio.wait_for(
+                    call_model_router(
+                        user_text, str(chat_id),
+                        telegram_user_id=telegram_user_id,
+                        display_name=display_name,
+                        trace_id=str(event.trace_id),
+                    ),
+                    timeout=PROCESS_HARD_DEADLINE,
+                )
+            except asyncio.TimeoutError:
+                logging.error(
+                    f"[Kernel] Обработка сообщения из чата {chat_id} превысила "
+                    f"{PROCESS_HARD_DEADLINE}с — прерываю принудительно, чтобы не "
+                    "заблокировать ядро для остальных сообщений"
+                )
+                await memory.log_decision(
+                    str(event.trace_id), None, "hard_deadline_exceeded",
+                    details={"timeout": PROCESS_HARD_DEADLINE, "chat_id": chat_id},
+                )
+                ai_response = (
+                    "Извини, обработка запроса зависла и была прервана "
+                    "(превышен предельный таймаут). Попробуй ещё раз."
+                )
 
             command_event = BaseEvent(
                 trace_id=event.trace_id,

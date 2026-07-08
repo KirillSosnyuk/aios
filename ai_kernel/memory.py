@@ -31,6 +31,16 @@ DB_NAME = os.getenv("DB_NAME", "aios_world_model")
 
 _pool: Optional[asyncpg.Pool] = None
 
+# У asyncpg pool.acquire() по умолчанию НЕТ таймаута — если пул исчерпан
+# (например, где-то соединение не вернулось в пул из-за бага) или Postgres
+# завис, acquire() ждёт СКОЛЬКО УГОДНО, не поднимая исключение. Наши функции
+# ловят Exception и деградируют gracefully, но зависший acquire() — это не
+# исключение, а вечное ожидание, которое try/except не перехватит. Раньше
+# именно это, судя по всему, повесило обработку сообщения целиком на
+# несколько минут без единой строчки в логах. Явный timeout превращает
+# зависание в TimeoutError, который уже ловится как обычная ошибка.
+POOL_ACQUIRE_TIMEOUT = 5.0
+
 # Идентификаторы (SERIAL/id) вместо UUID для простоты на этом этапе проекта;
 # trace_id храним как TEXT, а не как Postgres UUID — чтобы не зависеть от
 # того, передали ли его строкой или объектом uuid.UUID на стороне вызова.
@@ -100,7 +110,7 @@ async def init_pool(retries: int = 5, delay: float = 2.0) -> None:
                 host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD,
                 database=DB_NAME, min_size=1, max_size=5,
             )
-            async with _pool.acquire() as conn:
+            async with _pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
                 await conn.execute(SCHEMA)
             logger.info("[Memory] Подключено к Postgres, схема готова")
             return
@@ -126,7 +136,7 @@ async def get_or_create_user(telegram_id: Optional[int], display_name: Optional[
     if not _ready() or not telegram_id:
         return None
     try:
-        async with _pool.acquire() as conn:
+        async with _pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO users (telegram_id, display_name)
@@ -147,7 +157,7 @@ async def set_preference(user_id: Optional[int], category: str, key: str, value:
     if not _ready() or not user_id:
         return
     try:
-        async with _pool.acquire() as conn:
+        async with _pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
             await conn.execute(
                 """
                 INSERT INTO preferences (user_id, category, key, value)
@@ -165,7 +175,7 @@ async def add_memory_entry(user_id: Optional[int], content: str, category: str =
     if not _ready() or not user_id:
         return
     try:
-        async with _pool.acquire() as conn:
+        async with _pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
             await conn.execute(
                 "INSERT INTO memory_entries (user_id, content, category, source) VALUES ($1, $2, $3, $4)",
                 user_id, content, category, source,
@@ -182,7 +192,7 @@ async def build_profile_blurb(user_id: Optional[int], max_memories: int = 8) -> 
         return ""
 
     try:
-        async with _pool.acquire() as conn:
+        async with _pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
             user_row = await conn.fetchrow("SELECT display_name FROM users WHERE id = $1", user_id)
             prefs = await conn.fetch(
                 "SELECT category, key, value FROM preferences WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 20",
@@ -227,7 +237,7 @@ async def log_decision(
     if not _ready():
         return
     try:
-        async with _pool.acquire() as conn:
+        async with _pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
             await conn.execute(
                 """
                 INSERT INTO audit_records (trace_id, user_id, decision, model_used, permission_level, details)
