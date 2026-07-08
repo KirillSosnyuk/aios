@@ -87,6 +87,22 @@ def _parse_tavily(payload: dict) -> List[Dict[str, str]]:
     return out
 
 
+def _inject_answer(results: List[Dict[str, str]], payload: dict) -> List[Dict[str, str]]:
+    """Если Tavily вернул готовый краткий ответ по источникам (`answer`) —
+    ставим его ПЕРВЫМ блоком выдачи. Это grounded-ответ (синтез Tavily из
+    реальной выдачи), на который модели надёжнее опереться, чем сочинять
+    детали самой — прямое средство против галлюцинаций на фактических вопросах
+    (ровно то, ради чего поиск и нужен)."""
+    answer = ((payload or {}).get("answer") or "").strip()
+    if answer:
+        return [{
+            "title": "Краткий ответ по источникам (Tavily)",
+            "href": "",
+            "body": answer,
+        }] + list(results)
+    return results
+
+
 async def _search_tavily(query: str) -> List[Dict[str, str]]:
     """Поиск через Tavily API (официальный HTTP-эндпоинт, не скрейпинг).
 
@@ -101,7 +117,7 @@ async def _search_tavily(query: str) -> List[Dict[str, str]]:
         "query": query,
         "max_results": MAX_RESULTS,
         "search_depth": "basic",
-        "include_answer": False,
+        "include_answer": True,  # grounded-ответ от Tavily — опора против выдумок
     }
     headers = {"Authorization": f"Bearer {TAVILY_API_KEY}"}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -110,7 +126,8 @@ async def _search_tavily(query: str) -> List[Dict[str, str]]:
     if resp.status_code == 429:
         raise SearchRateLimited("Tavily 429")
     resp.raise_for_status()
-    return _parse_tavily(resp.json())
+    data = resp.json()
+    return _inject_answer(_parse_tavily(data), data)
 
 
 # --- Провайдер: ddgs (аварийный фолбэк) -----------------------------------
