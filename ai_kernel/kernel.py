@@ -379,17 +379,29 @@ async def handle_tool_calls(
         # вызвать инструмент ещё раз, упрётся в ошибку вместо обычного ответа.
         # Если лимит поисковых попыток исчерпан — убираем search_web из списка
         # доступных инструментов физически (а не просто просим модель "не
-        # искать больше" текстом): так модель не может запросить его снова в
-        # принципе и вынуждена ответить тем, что уже есть в истории диалога.
+        # искать больше" текстом).
         available_tools = TOOLS_MANIFEST
+        extra_kwargs = {}
         if search_calls_used >= MAX_SEARCH_CALLS_PER_TURN:
             available_tools = [t for t in TOOLS_MANIFEST if t["function"]["name"] != "search_web"]
+            # 2026-07-08: одного лишь удаления инструмента из tools=
+            # недостаточно — на практике gpt-oss-120b всё равно попытался
+            # СГЕНЕРИРОВАТЬ вызов search_web, которого в tools уже не было, и
+            # Groq ответил жёстким 400 ("attempted to call tool 'search_web'
+            # which was not in request.tools") вместо того, чтобы просто
+            # проигнорировать/поправить это — то есть провайдер валидирует
+            # ПОСЛЕ генерации, а не ограничивает саму генерацию. tool_choice=
+            # "none" — это явный, отдельный от списка tools параметр именно
+            # для "не вызывай вообще ничего в этом ответе", который должен
+            # реально ограничивать генерацию, а не только пост-валидацию.
+            extra_kwargs["tool_choice"] = "none"
 
         response = await client.chat.completions.create(
             model=model_name,
             messages=messages,
             tools=available_tools,
-            timeout=timeout
+            timeout=timeout,
+            **extra_kwargs,
         )
 
         if response.choices[0].message.tool_calls:
