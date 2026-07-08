@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import json
+import re
 from typing import Optional
 from redis.asyncio import Redis
 from openai import AsyncOpenAI, RateLimitError
@@ -84,7 +85,14 @@ PROCESS_HARD_DEADLINE = 150.0
 # (например, 4 рецепта вместо одного совета). Облако намеренно НЕ ограничено —
 # когда до него доходит очередь, пользователь уже готов подождать чуть дольше
 # ради более полного ответа.
-LOCAL_MAX_TOKENS = 400
+# 2026-07-08: поднято с 400 до 600. Подозрение, что thinking-режим Qwen3
+# подавляется не на 100% (см. _clean_ai_reply) — если невидимый <think>-блок
+# иногда всё же генерируется, он ест токены ИЗ ЭТОГО ЖЕ бюджета раньше, чем
+# модель доходит до видимого ответа, и на сам ответ может не остаться места
+# (наблюдался обрыв ответа посреди слова). 600 токенов при ~55 ток/с на этом
+# железе — это ~11с, всё ещё далеко от LOCAL_TIMEOUT=25, но с запасом на
+# случайный проскочивший think-блок.
+LOCAL_MAX_TOKENS = 600
 # ВРЕМЕННО поднято с 8 до 25 секунд (2026-07-08): облачный фоллбэк (бесплатный
 # тариф Groq) сейчас сам по себе периодически недоступен на 46-54 секунды
 # (Retry-After под нагрузкой) — при таком раскладе быстрый таймаут локалки
@@ -104,6 +112,31 @@ LOCAL_BREVITY_SUFFIX = (
     "того заслуживает — дай сжатую суть и предложи спросить подробнее, если "
     "понадобится."
 )
+
+
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _clean_ai_reply(text: Optional[str]) -> Optional[str]:
+    """Защитная зачистка ответа перед показом пользователю.
+
+    2026-07-08: несмотря на extra_body enable_thinking=False И текстовый
+    /no_think в промпте, есть подозрение, что thinking иногда всё равно
+    частично отрабатывает (см. кейс с обрывом ответа про Галкина посреди
+    слова: "...занимался б") — вероятно, невидимый <think>-блок съедает
+    бюджет LOCAL_MAX_TOKENS, и на сам ответ токенов не остаётся. Два случая:
+      1) <think> есть, </think> есть — thinking всё-таки просочился в
+         content целиком; вырезаем блок, показываем только настоящий ответ.
+      2) <think> есть, </think> НЕТ — обрыв случился ВНУТРИ рассуждений,
+         никакого настоящего ответа в тексте нет вообще; возвращаем None,
+         чтобы вызывающий код подставил честное сообщение вместо мусора
+         вроде оборванного на середине слова.
+    """
+    if not text:
+        return text
+    if "<think>" in text and "</think>" not in text:
+        return None
+    return _THINK_TAG_RE.sub("", text).strip() or text
 
 
 async def get_chat_history(chat_id: str) -> list:
@@ -356,6 +389,8 @@ async def _run_cloud_fallback(
             else:
                 ai_reply = response.choices[0].message.content
 
+        ai_reply = _clean_ai_reply(ai_reply) or "Не получилось сформулировать ответ — попробуй переформулировать вопрос."
+
         await save_chat_message(chat_id, "user", user_text)
         await save_chat_message(chat_id, "assistant", ai_reply)
         await memory.log_decision(trace_id, user_id, decision_label, model_used=FALLBACK_MODEL)
@@ -428,6 +463,14 @@ async def call_model_router(
         "вопрос — НЕ переформулируй запрос бесконечно и не ищи заново по кругу. "
         "Прямо скажи, что не нашёл актуальной информации, и ответь тем, что "
         "знаешь, или предложи уточнить вопрос. "
+        "ВАЖНОЕ ПРАВИЛО ТОЧНОСТИ: если вопрос касается конкретных фактов о "
+        "реальных людях, организациях или событиях (биография, профессия, "
+        "рост/возраст/статистика, кто чем занимается, сравнения людей между "
+        "собой) — НЕ угадывай и не выдумывай правдоподобно звучащие детали. "
+        "Если не уверен на 100% — вызови search_web, чтобы проверить, а не "
+        "отвечай уверенным тоном непроверенные подробности. Если поиск "
+        "недоступен или не помог — честно скажи, что не уверен в деталях, "
+        "вместо того чтобы выдавать вымысел за факт. "
         "ВАЖНОЕ ПРАВИЛО ФОРМАТА: это чат в Telegram (в будущем — ещё и голосовой "
         "интерфейс), а не документ. НЕ используй markdown-разметку: никаких **, "
         "##-заголовков, таблиц с |, вложенных списков. Пиши обычным связным "
@@ -481,7 +524,21 @@ async def call_model_router(
                 reuse_tool_calls=response.choices[0].message.tool_calls,
             )
 
-        ai_reply = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
+        raw_reply = response.choices[0].message.content
+        ai_reply = _clean_ai_reply(raw_reply)
+        if ai_reply is None:
+            logging.warning(
+                f"[Kernel] Локальный ответ оборвался внутри thinking-блока "
+                f"(finish_reason={finish_reason}, LOCAL_MAX_TOKENS={LOCAL_MAX_TOKENS}) — "
+                f"сырой текст: {raw_reply!r}"
+            )
+            ai_reply = "Не успел сформулировать ответ за отведённое время — спроси ещё раз, желательно покороче."
+        elif finish_reason == "length":
+            logging.warning(
+                f"[Kernel] Локальный ответ обрезан по max_tokens (finish_reason=length) — "
+                f"возможно, не хватило запаса LOCAL_MAX_TOKENS={LOCAL_MAX_TOKENS}"
+            )
         await save_chat_message(chat_id, "user", user_text)
         await save_chat_message(chat_id, "assistant", ai_reply)
         await memory.log_decision(trace_id, user_id, "answered_local", model_used=PRIMARY_MODEL)
