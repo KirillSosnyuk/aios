@@ -380,29 +380,59 @@ async def handle_tool_calls(
         # Если лимит поисковых попыток исчерпан — убираем search_web из списка
         # доступных инструментов физически (а не просто просим модель "не
         # искать больше" текстом).
+        search_capped = search_calls_used >= MAX_SEARCH_CALLS_PER_TURN
         available_tools = TOOLS_MANIFEST
         extra_kwargs = {}
-        if search_calls_used >= MAX_SEARCH_CALLS_PER_TURN:
+        if search_capped:
             available_tools = [t for t in TOOLS_MANIFEST if t["function"]["name"] != "search_web"]
-            # 2026-07-08: одного лишь удаления инструмента из tools=
-            # недостаточно — на практике gpt-oss-120b всё равно попытался
-            # СГЕНЕРИРОВАТЬ вызов search_web, которого в tools уже не было, и
-            # Groq ответил жёстким 400 ("attempted to call tool 'search_web'
-            # which was not in request.tools") вместо того, чтобы просто
-            # проигнорировать/поправить это — то есть провайдер валидирует
-            # ПОСЛЕ генерации, а не ограничивает саму генерацию. tool_choice=
-            # "none" — это явный, отдельный от списка tools параметр именно
-            # для "не вызывай вообще ничего в этом ответе", который должен
-            # реально ограничивать генерацию, а не только пост-валидацию.
             extra_kwargs["tool_choice"] = "none"
 
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            tools=available_tools,
-            timeout=timeout,
-            **extra_kwargs,
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                tools=available_tools,
+                timeout=timeout,
+                **extra_kwargs,
+            )
+        except Exception as api_err:
+            if not search_capped:
+                raise
+            # 2026-07-08, ревизия 3: ни удаление search_web из tools=, ни
+            # tool_choice="none" не остановили gpt-oss-120b от ПОПЫТКИ
+            # всё равно сгенерировать вызов search_web — сначала Groq отвечал
+            # 400 "not in request.tools", теперь (после добавления
+            # tool_choice="none") — 400 "Tool choice is none, but model
+            # called a tool". Модель, похоже, продолжает паттерн из своей же
+            # истории (несколько прошлых assistant-ходов с tool_calls)
+            # независимо от того, что реально разрешено в ЭТОМ конкретном
+            # запросе — и Groq в обоих случаях жёстко отвергает запрос вместо
+            # того, чтобы проигнорировать лишний вызов. Раз оба API-уровневых
+            # способа "запретить" не сработали, пробуем последний вариант,
+            # которого ещё не было: полностью убрать сам параметр tools из
+            # запроса (а не пустой список / tool_choice) — вдруг дело именно
+            # в том, что сам факт наличия tools держит модель в "режиме
+            # вызова инструмента". Если и это не поможет — отдаём честное
+            # сообщение вместо неинформативного "Извини, произошла ошибка".
+            logging.warning(
+                f"[Kernel] Модель проигнорировала запрет на вызов инструмента "
+                f"(search_capped=True): {api_err}. Пробую финальный запрос "
+                f"вообще без tools=."
+            )
+            try:
+                fallback_response = await client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    timeout=timeout,
+                )
+                return _extract_final_reply(fallback_response, context_label=f"tools-no-tools-fallback:{model_name}")
+            except Exception as second_err:
+                logging.warning(f"[Kernel] Финальная попытка без tools= тоже не удалась: {second_err}")
+                return (
+                    "Не получилось найти свежую информацию по этому вопросу "
+                    "после нескольких попыток поиска — попробуй переформулировать "
+                    "запрос или спросить позже."
+                )
 
         if response.choices[0].message.tool_calls:
             tool_calls = response.choices[0].message.tool_calls
