@@ -375,64 +375,56 @@ async def handle_tool_calls(
             })
 
         # Повторный запрос к модели, теперь имея на руках результаты вызовов.
-        # ВАЖНО: tools= передаём и здесь — иначе модель, которая захочет
-        # вызвать инструмент ещё раз, упрётся в ошибку вместо обычного ответа.
-        # Если лимит поисковых попыток исчерпан — убираем search_web из списка
-        # доступных инструментов физически (а не просто просим модель "не
-        # искать больше" текстом).
+        #
+        # 2026-07-08, финальное решение по «Tool choice is none»: когда лимит
+        # поисковых попыток исчерпан, НЕЛЬЗЯ ни оставлять search_web в tools=,
+        # ни пытаться «запретить» его через tool_choice="none" или пустой
+        # список — Groq/gpt-oss в ответ жёстко отдаёт 400 ('Tool choice is
+        # none, but model called a tool' / 'tool not in request.tools'),
+        # потому что модель по инерции своей же истории всё равно генерирует
+        # вызов инструмента, а сервер это отвергает. Единственный надёжный
+        # способ — ВООБЩЕ не передавать параметр tools: без схемы инструментов
+        # модели нечего вызывать и нечему конфликтовать, и она отвечает
+        # обычным текстом. Плюс один раз явно сообщаем ей, что поиск исчерпан.
+        # (Прежние «ревизии 1-3» с available_tools/tool_choice="none" удалены —
+        # именно они и были источником самого 400, а не защитой от него.)
         search_capped = search_calls_used >= MAX_SEARCH_CALLS_PER_TURN
-        available_tools = TOOLS_MANIFEST
-        extra_kwargs = {}
-        if search_capped:
-            available_tools = [t for t in TOOLS_MANIFEST if t["function"]["name"] != "search_web"]
-            extra_kwargs["tool_choice"] = "none"
 
-        try:
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                tools=available_tools,
-                timeout=timeout,
-                **extra_kwargs,
-            )
-        except Exception as api_err:
-            if not search_capped:
-                raise
-            # 2026-07-08, ревизия 3: ни удаление search_web из tools=, ни
-            # tool_choice="none" не остановили gpt-oss-120b от ПОПЫТКИ
-            # всё равно сгенерировать вызов search_web — сначала Groq отвечал
-            # 400 "not in request.tools", теперь (после добавления
-            # tool_choice="none") — 400 "Tool choice is none, but model
-            # called a tool". Модель, похоже, продолжает паттерн из своей же
-            # истории (несколько прошлых assistant-ходов с tool_calls)
-            # независимо от того, что реально разрешено в ЭТОМ конкретном
-            # запросе — и Groq в обоих случаях жёстко отвергает запрос вместо
-            # того, чтобы проигнорировать лишний вызов. Раз оба API-уровневых
-            # способа "запретить" не сработали, пробуем последний вариант,
-            # которого ещё не было: полностью убрать сам параметр tools из
-            # запроса (а не пустой список / tool_choice) — вдруг дело именно
-            # в том, что сам факт наличия tools держит модель в "режиме
-            # вызова инструмента". Если и это не поможет — отдаём честное
-            # сообщение вместо неинформативного "Извини, произошла ошибка".
-            logging.warning(
-                f"[Kernel] Модель проигнорировала запрет на вызов инструмента "
-                f"(search_capped=True): {api_err}. Пробую финальный запрос "
-                f"вообще без tools=."
-            )
+        if search_capped:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Достигнут лимит попыток веб-поиска в этом запросе. "
+                    "Больше НЕ вызывай инструменты. Ответь пользователю тем, "
+                    "что уже известно из результатов выше, или честно скажи, "
+                    "что не удалось найти актуальную информацию."
+                ),
+            })
             try:
-                fallback_response = await client.chat.completions.create(
+                # tools НАМЕРЕННО не передаём (см. комментарий выше) — это и
+                # снимает 400 'Tool choice is none, but model called a tool'.
+                final = await client.chat.completions.create(
                     model=model_name,
                     messages=messages,
                     timeout=timeout,
                 )
-                return _extract_final_reply(fallback_response, context_label=f"tools-no-tools-fallback:{model_name}")
-            except Exception as second_err:
-                logging.warning(f"[Kernel] Финальная попытка без tools= тоже не удалась: {second_err}")
+            except Exception as api_err:
+                logging.warning(f"[Kernel] Финальный запрос без инструментов не удался: {api_err}")
                 return (
                     "Не получилось найти свежую информацию по этому вопросу "
                     "после нескольких попыток поиска — попробуй переформулировать "
                     "запрос или спросить позже."
                 )
+            return _extract_final_reply(final, context_label=f"tools-capped:{model_name}")
+
+        # Лимит не исчерпан — обычный раунд, tools= передаём (иначе модель,
+        # которая захочет вызвать инструмент ещё раз, упрётся в ошибку).
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            tools=TOOLS_MANIFEST,
+            timeout=timeout,
+        )
 
         if response.choices[0].message.tool_calls:
             tool_calls = response.choices[0].message.tool_calls

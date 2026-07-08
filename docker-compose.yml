@@ -41,6 +41,12 @@ services:
       - PRIMARY_MODEL=${PRIMARY_MODEL}
       - FALLBACK_MODEL=${FALLBACK_MODEL}
       - SEARCH_BACKEND=${SEARCH_BACKEND:-google,brave,duckduckgo}
+      # Основной поисковый провайдер (спецификация §4.8 Replaceable):
+      # auto|tavily|ddgs. auto = Tavily при заданном TAVILY_API_KEY, иначе
+      # ddgs. Без ключа система остаётся рабочей (падает на ddgs), просто
+      # менее надёжной — поэтому TAVILY_API_KEY по умолчанию пустой.
+      - SEARCH_PROVIDER=${SEARCH_PROVIDER:-auto}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       # Память/профиль (раздел 14) — те же дефолты, что и в блоке postgres
       # ниже, через :-default, а не голый ${VAR}: если переменная нигде не
       # задана, ${VAR} без дефолта подставит ПУСТУЮ строку внутрь контейнера,

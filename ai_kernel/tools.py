@@ -3,16 +3,21 @@ import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
+
+import httpx
 
 from memory import set_preference as _set_preference, add_memory_entry as _add_memory_entry
 
-# --- Импорт поискового движка ---------------------------------------------
-# Пакет `duckduckgo_search` заморожен в июле 2025 и переименован в `ddgs`.
-# Старое имя больше не получает фиксы анти-бот защиты DuckDuckGo и со временем
-# ломается. `ddgs` — это метапоиск: он агрегирует выдачу Google, Bing,
-# DuckDuckGo, Brave, Yahoo, Yandex и др. с автоматическим fallback между ними,
-# что само по себе куда устойчивее к rate-limit, чем старый DuckDuckGo-only клиент.
+# --- Поисковые движки ------------------------------------------------------
+# ddgs остаётся как БЕСПЛАТНЫЙ фолбэк (не требует ключа). Пакет
+# `duckduckgo_search` заморожен в июле 2025 и переименован в `ddgs`; старое имя
+# больше не получает фиксы анти-бот защиты и со временем ломается. Но сам ddgs —
+# это неофициальный скрейпинг выдачи Google/Brave/DDG, и он В ПРИНЦИПЕ
+# периодически спотыкается о капчи (202), rate-limit (429) и смену вёрстки
+# (200, но «No results found»). Именно это давало «поиск работает через раз».
+# Поэтому основным движком теперь является официальный HTTP-API (Tavily,
+# см. _search_tavily), а ddgs — только аварийный запасной путь.
 try:
     from ddgs import DDGS
     from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
@@ -28,40 +33,90 @@ logger = logging.getLogger("aios.tools.search")
 
 # --- Настройки -------------------------------------------------------------
 MAX_RESULTS = 5
-# Было 3: внутренний ретрай здесь умножается на внешний (модель сама может
-# переформулировать запрос и вызвать search_web ещё раз в следующем раунде
-# handle_tool_calls) — 3×несколько раундов на практике выливалось в добрый
-# десяток запросов к Google/Brave за один вопрос пользователя и укладывало
-# Brave в rate limit. 2 попытки внутри — достаточно для реальных сетевых
-# сбоев, а не для маскировки того, что движок in principle не находит ответ.
-MAX_RETRIES = 2
-HTTP_TIMEOUT = 10  # сек на один HTTP-запрос движка
+MAX_RETRIES = 2          # попыток внутри ddgs-движка (реальные сетевые сбои)
+HTTP_TIMEOUT = 10        # сек на один HTTP-запрос движка
 
-# backend="auto" перебирает до 5-6 движков за один вызов (wikipedia, grokipedia,
-# google, yahoo, brave, startpage, ...), включая нестабильные (startpage часто
-# отдаёт капчу, grokipedia иногда 502) — это и есть основная причина долгого
-# поиска. Явно ограничиваем небольшим набором быстрых и обычно надёжных
-# движков; при необходимости меняется через .env без правки кода.
-# 2026-07-08: добавлен duckduckgo третьим движком. В реальном инциденте
-# (вопрос о росте Галкина) Google 4/4 раза вернул 200, но ddgs не смог
-# распарсить из ответа результаты ("No results found" — похоже на то, что
-# Google отдал непривычную для парсера структуру страницы), а Brave все 8/8
-# раз словил 429 (исчерпан лимит запросов). Раз оба сконфигурированных
-# движка одновременно неработоспособны — это не разовая случайность, а
-# показатель того, что двух движков мало для устойчивости; независимая третья
-# инфраструктура снижает шанс одновременного отказа всех сразу. Это не
-# устраняет саму природу проблемы (неофициальный скрейпинг вместо платного
-# API всегда будет периодически спотыкаться о капчи/рейт-лимиты/смену
-# вёрстки) — это смягчение, а не полное решение.
+# Провайдер поиска — абстракция (спецификация §4.8 Replaceable, §21 unified API):
+# движок переключается через .env БЕЗ правки кода. Значения:
+#   "auto"   — Tavily, если задан TAVILY_API_KEY, иначе ddgs (по умолчанию);
+#   "tavily" — Tavily основным + ddgs как аварийный фолбэк;
+#   "ddgs"   — только старый скрейпинг-движок (совсем без внешнего ключа).
+# Добавить Brave/SearXNG позже — это ещё одна функция-провайдер и одна строка в
+# _provider_chain(), не трогая ни kernel.py, ни контракт search_web().
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "auto").strip().lower()
+
+# Tavily — поисковый API, спроектированный под LLM-агентов: отдаёт готовые
+# ранжированные сниппеты (а не сырой HTML, который нужно парсить), и делает это
+# по официальному эндпоинту с ключом — без капч и произвольной смены вёрстки.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+TAVILY_URL = "https://api.tavily.com/search"
+
+# Движки для ddgs-фолбэка. backend="auto" перебирал бы до 5-6 движков за вызов,
+# включая нестабильные (startpage — капча, grokipedia — 502) — это и была одна
+# из причин долгого/пустого поиска. Держим короткий список; меняется через .env.
 SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "google,brave,duckduckgo")
 
 
-def _run_search_sync(query: str) -> List[Dict[str, str]]:
-    """Блокирующий поиск с ретраями и экспоненциальным backoff.
+class SearchRateLimited(Exception):
+    """Единый для всех провайдеров тип «нас ограничили по частоте» (429).
 
-    Выполняется в отдельном потоке (см. search_web), поэтому здесь можно
-    безопасно использовать time.sleep, не блокируя event loop ядра.
-    Если все попытки провалились — пробрасывает последнее исключение наверх.
+    Нужен, чтобы search_web мог отличить rate-limit (есть смысл сообщить
+    «попробуй через минуту») от обычной ошибки движка и единообразно уйти в
+    следующий провайдер цепочки, не зная деталей конкретного SDK.
+    """
+
+
+# --- Провайдер: Tavily (основной) -----------------------------------------
+def _parse_tavily(payload: dict) -> List[Dict[str, str]]:
+    """Нормализует ответ Tavily к общему виду {title, href, body}.
+
+    Вынесено отдельно от HTTP-вызова, чтобы парсинг можно было проверить
+    юнит-тестом без сети (в песочнице внешней сети нет).
+    """
+    out: List[Dict[str, str]] = []
+    for r in (payload or {}).get("results", []) or []:
+        out.append({
+            "title": r.get("title") or "Без заголовка",
+            "href": r.get("url") or "—",
+            "body": r.get("content") or "Нет описания",
+        })
+    return out
+
+
+async def _search_tavily(query: str) -> List[Dict[str, str]]:
+    """Поиск через Tavily API (официальный HTTP-эндпоинт, не скрейпинг).
+
+    httpx уже в зависимостях (его тянет openai) — отдельный SDK не нужен.
+    Бросает SearchRateLimited на 429 и обычное исключение на прочих ошибках;
+    решение «падать или в фолбэк» принимает search_web.
+    """
+    if not TAVILY_API_KEY:
+        raise RuntimeError("TAVILY_API_KEY не задан — Tavily недоступен")
+
+    body = {
+        "query": query,
+        "max_results": MAX_RESULTS,
+        "search_depth": "basic",
+        "include_answer": False,
+    }
+    headers = {"Authorization": f"Bearer {TAVILY_API_KEY}"}
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        resp = await client.post(TAVILY_URL, json=body, headers=headers)
+
+    if resp.status_code == 429:
+        raise SearchRateLimited("Tavily 429")
+    resp.raise_for_status()
+    return _parse_tavily(resp.json())
+
+
+# --- Провайдер: ddgs (аварийный фолбэк) -----------------------------------
+def _run_ddgs_sync(query: str) -> List[Dict[str, str]]:
+    """Блокирующий поиск ddgs с ретраями и экспоненциальным backoff.
+
+    Выполняется в пуле потоков (см. _search_ddgs), поэтому time.sleep здесь
+    не блокирует event loop ядра. Если все попытки провалились — пробрасывает
+    последнее исключение наверх (RatelimitException конвертируется в
+    SearchRateLimited уже в _search_ddgs).
     """
     last_error: Optional[Exception] = None
 
@@ -73,32 +128,63 @@ def _run_search_sync(query: str) -> List[Dict[str, str]]:
                 )
             if results:
                 return results
-            logger.info("[search] Пустая выдача (попытка %s/%s)", attempt, MAX_RETRIES)
+            logger.info("[search] ddgs: пустая выдача (попытка %s/%s)", attempt, MAX_RETRIES)
         except RatelimitException as e:
             last_error = e
             wait = 2 ** attempt + random.uniform(0, 1)  # ~2..9 сек + джиттер
             logger.warning(
-                "[search] Rate limit (попытка %s/%s). Пауза %.1f с.",
+                "[search] ddgs rate limit (попытка %s/%s). Пауза %.1f с.",
                 attempt, MAX_RETRIES, wait,
             )
             time.sleep(wait)
         except (TimeoutException, DDGSException) as e:
             last_error = e
-            logger.warning(
-                "[search] Ошибка движка (попытка %s/%s): %s", attempt, MAX_RETRIES, e
-            )
+            logger.warning("[search] ddgs ошибка (попытка %s/%s): %s", attempt, MAX_RETRIES, e)
             time.sleep(1)
         except Exception as e:  # сеть, DNS и прочее непредвиденное
             last_error = e
-            logger.error(
-                "[search] Непредвиденная ошибка (попытка %s/%s): %s",
-                attempt, MAX_RETRIES, e,
-            )
+            logger.error("[search] ddgs непредвиденная ошибка (попытка %s/%s): %s", attempt, MAX_RETRIES, e)
             time.sleep(1)
 
     if last_error is not None:
         raise last_error
     return []
+
+
+async def _search_ddgs(query: str) -> List[Dict[str, str]]:
+    """Асинхронная обёртка ddgs: уводит блокирующий вызов в пул потоков и
+    нормализует выдачу к общему виду {title, href, body}."""
+    loop = asyncio.get_running_loop()
+    try:
+        raw = await loop.run_in_executor(None, _run_ddgs_sync, query)
+    except RatelimitException as e:
+        raise SearchRateLimited(str(e))
+    return [
+        {
+            "title": r.get("title") or "Без заголовка",
+            "href": r.get("href") or r.get("link") or "—",
+            "body": r.get("body") or "Нет описания",
+        }
+        for r in raw
+    ]
+
+
+# --- Выбор цепочки провайдеров --------------------------------------------
+def _provider_chain() -> List[Tuple[str, Callable]]:
+    """Возвращает упорядоченный список (имя, функция-провайдер).
+
+    Первый провайдер — основной, остальные — фолбэки, к которым search_web
+    переходит по очереди при ошибке/пустой выдаче предыдущего.
+    """
+    if SEARCH_PROVIDER == "ddgs":
+        return [("ddgs", _search_ddgs)]
+    if SEARCH_PROVIDER == "tavily":
+        return [("tavily", _search_tavily), ("ddgs", _search_ddgs)]
+    # "auto" (по умолчанию): Tavily, если есть ключ, иначе только ddgs —
+    # система остаётся рабочей ещё ДО того, как пользователь заведёт ключ.
+    if TAVILY_API_KEY:
+        return [("tavily", _search_tavily), ("ddgs", _search_ddgs)]
+    return [("ddgs", _search_ddgs)]
 
 
 def _format_results(results: List[Dict[str, str]]) -> str:
@@ -113,34 +199,49 @@ def _format_results(results: List[Dict[str, str]]) -> str:
 
 
 async def search_web(query: str) -> str:
-    """Асинхронная обёртка веб-поиска для ядра AIOS.
+    """Асинхронный веб-поиск ядра AIOS с цепочкой провайдеров.
 
+    Идёт по _provider_chain() по очереди: первый провайдер, вернувший
+    непустой результат, выигрывает; ошибка/пусто — переход к следующему.
     Возвращает готовый текст с результатами или понятное сообщение об ошибке.
     Никогда не возвращает None — контракт с kernel.handle_tool_calls сохранён.
     """
     if not query or not query.strip():
         return "Пустой поисковый запрос."
 
+    query = query.strip()
     logger.info("[search] Запрос: %r", query)
-    loop = asyncio.get_running_loop()
 
-    try:
-        # DDGS синхронный и блокирующий — уводим его в пул потоков, чтобы
-        # event loop ядра продолжал обслуживать другие события во время поиска.
-        results = await loop.run_in_executor(None, _run_search_sync, query)
-    except RatelimitException:
+    chain = _provider_chain()
+    rate_limited = False
+    last_error: Optional[Exception] = None
+
+    for name, fn in chain:
+        try:
+            results = await fn(query)
+        except SearchRateLimited as e:
+            rate_limited = True
+            last_error = e
+            logger.warning("[search] %s: rate limit — перехожу к следующему движку", name)
+            continue
+        except Exception as e:
+            last_error = e
+            logger.warning("[search] %s: ошибка (%s) — перехожу к следующему движку", name, e)
+            continue
+
+        if results:
+            logger.info("[search] %s: %d результат(ов)", name, len(results))
+            return _format_results(results)
+        logger.info("[search] %s: пустая выдача", name)
+
+    if rate_limited:
         return (
-            "Поиск временно недоступен: поисковые движки ограничили частоту "
-            "запросов (rate limit). Попробуй ещё раз через минуту."
+            "Поиск временно недоступен: движки ограничили частоту запросов "
+            "(rate limit). Попробуй ещё раз через минуту."
         )
-    except Exception as e:
-        logger.error("[search] Поиск не выполнен: %s", e)
-        return f"Не удалось выполнить поиск: {e}"
-
-    if not results:
-        return "По этому запросу ничего не найдено. Уточни формулировку."
-
-    return _format_results(results)
+    if last_error is not None:
+        logger.error("[search] Поиск не выполнен (последняя ошибка: %s)", last_error)
+    return "По этому запросу ничего не найдено. Уточни формулировку."
 
 
 async def remember_preference(user_id: Optional[int], facts: Optional[list]) -> str:
