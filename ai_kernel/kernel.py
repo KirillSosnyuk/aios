@@ -55,7 +55,14 @@ TOOL_PERMISSION_LEVELS = {
     "remember_preference": 0,  # запись факта о пользователе — безвредно (18.3)
     "add_memory_note": 0,      # запись свободной заметки — тоже безвредно
 }
-DEFAULT_PERMISSION_LEVEL = 1  # для инструментов, не описанных явно выше
+# 2026-07-08: было 1 (= авто-разрешено, т.к. MAX_AUTO_PERMISSION_LEVEL тоже
+# 1). Это значит, что ЛЮБОЙ новый инструмент, который забыли явно добавить в
+# TOOL_PERMISSION_LEVELS, по умолчанию молча авто-выполнялся бы — fail-open
+# вместо fail-closed. Сейчас это не эксплуатируется (все 3 существующих
+# инструмента явно перечислены выше), но это неверная защита по умолчанию на
+# будущее: новая, потенциально опасная возможность должна по умолчанию
+# требовать подтверждения, пока её явно не пометят безопасной, а не наоборот.
+DEFAULT_PERMISSION_LEVEL = 2  # для инструментов, не описанных явно выше — блокируется (см. MAX_AUTO_PERMISSION_LEVEL)
 
 # Интерактивный UX подтверждения (кнопки в Telegram и т.п. для уровня 2+) ещё
 # не реализован — его нельзя ни протестировать, ни использовать вслепую.
@@ -75,9 +82,14 @@ MAX_AUTO_PERMISSION_LEVEL = 1
 # а обычное ожидание) — раньше это останавливало бота целиком без единой
 # строчки в логах. Теперь такой сценарий гарантированно обрывается по
 # таймауту, и ядро возвращается к очереди, а не подвисает навсегда.
-# 150 секунд — с запасом под легитимный случай (LOCAL_TIMEOUT=25 + до 6
-# раундов инструментов по timeout=20 каждый на облаке), но не бесконечность.
-PROCESS_HARD_DEADLINE = 150.0
+# 180 секунд (2026-07-08: поднято со 150). Легитимный сценарий сам по себе
+# может занять до ~145с (LOCAL_TIMEOUT=25 + до 6 раундов инструментов по
+# timeout=20 каждый на облаке = 25+120), а 150 оставляли только 5с запаса на
+# всё остальное (обращения к памяти, публикацию статусов, сетевые накладные
+# расходы) — слишком туго: легитимный медленный запрос рисковал попасть под
+# тот же таймаут, что и настоящее зависание. 180 даёт разумный запас, не
+# превращаясь в бесконечность.
+PROCESS_HARD_DEADLINE = 180.0
 
 # Локальная модель — быстрый путь. Ограничиваем длину её ответа: во-первых,
 # это напрямую сокращает время генерации (меньше токенов — меньше времени),
@@ -85,13 +97,16 @@ PROCESS_HARD_DEADLINE = 150.0
 # (например, 4 рецепта вместо одного совета). Облако намеренно НЕ ограничено —
 # когда до него доходит очередь, пользователь уже готов подождать чуть дольше
 # ради более полного ответа.
-# 2026-07-08: поднято с 400 до 600. Подозрение, что thinking-режим Qwen3
-# подавляется не на 100% (см. _clean_ai_reply) — если невидимый <think>-блок
-# иногда всё же генерируется, он ест токены ИЗ ЭТОГО ЖЕ бюджета раньше, чем
-# модель доходит до видимого ответа, и на сам ответ может не остаться места
-# (наблюдался обрыв ответа посреди слова). 600 токенов при ~55 ток/с на этом
-# железе — это ~11с, всё ещё далеко от LOCAL_TIMEOUT=25, но с запасом на
-# случайный проскочивший think-блок.
+# 2026-07-08: поднято с 400 до 600. Раньше thinking-режим Qwen3 подавлялся
+# только через chat_template_kwargs, который OpenAI-совместимый эндпоинт
+# Ollama, как выяснилось, вообще игнорирует (см. reasoning_effort ниже и
+# комментарий в _extract_final_reply) — то есть thinking, скорее всего, был
+# активен всё это время и ел токены ИЗ ЭТОГО ЖЕ бюджета раньше, чем модель
+# доходила до видимого ответа (отсюда и обрыв ответа посреди слова). Теперь,
+# когда reasoning_effort="none" должен реально отключать thinking, 600 —
+# это запас на случай, если он всё-таки где-то просочится, а не компенсация
+# основной причины. 600 токенов при ~55 ток/с на этом железе — это ~11с,
+# всё ещё далеко от LOCAL_TIMEOUT=25.
 LOCAL_MAX_TOKENS = 600
 # ВРЕМЕННО поднято с 8 до 25 секунд (2026-07-08): облачный фоллбэк (бесплатный
 # тариф Groq) сейчас сам по себе периодически недоступен на 46-54 секунды
@@ -116,27 +131,51 @@ LOCAL_BREVITY_SUFFIX = (
 
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
+_TRUNCATION_FALLBACK_MSG = (
+    "Не успел сформулировать полный ответ за отведённое время — спроси ещё "
+    "раз, желательно покороче."
+)
 
-def _clean_ai_reply(text: Optional[str]) -> Optional[str]:
-    """Защитная зачистка ответа перед показом пользователю.
 
-    2026-07-08: несмотря на extra_body enable_thinking=False И текстовый
-    /no_think в промпте, есть подозрение, что thinking иногда всё равно
-    частично отрабатывает (см. кейс с обрывом ответа про Галкина посреди
-    слова: "...занимался б") — вероятно, невидимый <think>-блок съедает
-    бюджет LOCAL_MAX_TOKENS, и на сам ответ токенов не остаётся. Два случая:
-      1) <think> есть, </think> есть — thinking всё-таки просочился в
-         content целиком; вырезаем блок, показываем только настоящий ответ.
-      2) <think> есть, </think> НЕТ — обрыв случился ВНУТРИ рассуждений,
-         никакого настоящего ответа в тексте нет вообще; возвращаем None,
-         чтобы вызывающий код подставил честное сообщение вместо мусора
-         вроде оборванного на середине слова.
+def _extract_final_reply(response, context_label: str = "") -> str:
+    """Единственная точка превращения сырого ответа API в текст для пользователя.
+
+    2026-07-08, ревизия 2: изначально причиной обрыва ответа посреди слова
+    ("...занимался б" в истории с Галкиным) считался просочившийся в content
+    <think>-блок. Проверка по документации Ollama (docs.ollama.com/api/
+    openai-compatibility, github.com/ollama/ollama/issues/14820) показала,
+    что это было верно лишь отчасти: OpenAI-совместимый эндпоинт Ollama
+    ВООБЩЕ НЕ смотрит на chat_template_kwargs.enable_thinking (это параметр
+    нативного шаблона Qwen3, который на этом эндпоинте молча игнорируется) —
+    официальный переключатель thinking там reasoning_effort="none" (см. его
+    в call_model_router). То есть все предыдущие попытки подавить thinking,
+    скорее всего, вообще не работали, и обрыв ответа мог случаться и БЕЗ
+    каких-либо <think>-тегов в content — просто потому что невидимые
+    reasoning-токены съедали LOCAL_MAX_TOKENS до того, как модель успевала
+    записать видимый ответ.
+
+    Поэтому проверка здесь НЕ полагается на наличие <think>-тегов как на
+    единственный сигнал обрыва — авторитетный сигнал это finish_reason
+    ("length" = обрезано по max_tokens, вне зависимости от того, что именно
+    успело попасть в content). <think>-теги вырезаются отдельно как чистая
+    защитная зачистка на случай, если thinking всё же просочится в content
+    целиком на каком-то будущем/другом провайдере.
     """
-    if not text:
-        return text
-    if "<think>" in text and "</think>" not in text:
-        return None
-    return _THINK_TAG_RE.sub("", text).strip() or text
+    choice = response.choices[0]
+    finish_reason = choice.finish_reason
+    raw = choice.message.content
+
+    truncated_inside_think = bool(raw) and "<think>" in raw and "</think>" not in raw
+    cleaned = _THINK_TAG_RE.sub("", raw).strip() if raw else raw
+
+    if finish_reason == "length" or truncated_inside_think or not cleaned:
+        logging.warning(
+            f"[Kernel] Ответ обрезан или пуст ({context_label}, "
+            f"finish_reason={finish_reason}) — сырой текст: {raw!r}"
+        )
+        return _TRUNCATION_FALLBACK_MSG
+
+    return cleaned
 
 
 async def get_chat_history(chat_id: str) -> list:
@@ -322,7 +361,7 @@ async def handle_tool_calls(
             tool_calls = response.choices[0].message.tool_calls
             continue  # модель просит ещё один раунд
 
-        return response.choices[0].message.content
+        return _extract_final_reply(response, context_label=f"tools:{model_name}")
 
     # Лимит раундов исчерпан, а модель всё ещё пытается вызывать инструменты —
     # не зависаем и не падаем, отдаём понятное сообщение вместо ошибки. Часть
@@ -387,9 +426,7 @@ async def _run_cloud_fallback(
                     user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=20.0,
                 )
             else:
-                ai_reply = response.choices[0].message.content
-
-        ai_reply = _clean_ai_reply(ai_reply) or "Не получилось сформулировать ответ — попробуй переформулировать вопрос."
+                ai_reply = _extract_final_reply(response, context_label=f"cloud:{FALLBACK_MODEL}")
 
         await save_chat_message(chat_id, "user", user_text)
         await save_chat_message(chat_id, "assistant", ai_reply)
@@ -501,11 +538,22 @@ async def call_model_router(
             # Qwen3 — гибридная "thinking"-модель: по умолчанию перед ЛЮБЫМ
             # ответом (даже простым решением "вызвать ли инструмент") генерит
             # видимую цепочку рассуждений, которая ничего не даёт для такой
-            # простой задачи, но заметно удлиняет ответ. Для голосового
-            # интерфейса в планах это неприемлемо в принципе, поэтому глушим
-            # thinking на уровне запроса (a не только промптом — это официальный
-            # параметр чат-шаблона Qwen3 через OpenAI-совместимый эндпоинт Ollama).
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            # простой задачи, но заметно удлиняет ответ и ест бюджет
+            # LOCAL_MAX_TOKENS ещё до видимого ответа.
+            # 2026-07-08, ревизия 2: chat_template_kwargs.enable_thinking — это
+            # параметр НАТИВНОГО шаблона Qwen3 (как его понимают vLLM/
+            # transformers), а OpenAI-совместимый эндпоинт Ollama на него
+            # вообще не смотрит — то есть эта строка, скорее всего, никогда не
+            # работала. Официально задокументированный способ (проверено по
+            # исходникам Ollama: github.com/ollama/ollama/issues/14820 и
+            # docs.ollama.com/api/openai-compatibility) — поле reasoning_effort:
+            # "none". Оставляем оба варианта одновременно: reasoning_effort как
+            # реально рабочий механизм, chat_template_kwargs — как безвредный
+            # запасной на случай других провайдеров, которые всё же его учитывают.
+            extra_body={
+                "reasoning_effort": "none",
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
         )
 
         if response.choices[0].message.tool_calls:
@@ -524,21 +572,7 @@ async def call_model_router(
                 reuse_tool_calls=response.choices[0].message.tool_calls,
             )
 
-        finish_reason = response.choices[0].finish_reason
-        raw_reply = response.choices[0].message.content
-        ai_reply = _clean_ai_reply(raw_reply)
-        if ai_reply is None:
-            logging.warning(
-                f"[Kernel] Локальный ответ оборвался внутри thinking-блока "
-                f"(finish_reason={finish_reason}, LOCAL_MAX_TOKENS={LOCAL_MAX_TOKENS}) — "
-                f"сырой текст: {raw_reply!r}"
-            )
-            ai_reply = "Не успел сформулировать ответ за отведённое время — спроси ещё раз, желательно покороче."
-        elif finish_reason == "length":
-            logging.warning(
-                f"[Kernel] Локальный ответ обрезан по max_tokens (finish_reason=length) — "
-                f"возможно, не хватило запаса LOCAL_MAX_TOKENS={LOCAL_MAX_TOKENS}"
-            )
+        ai_reply = _extract_final_reply(response, context_label=f"local:{PRIMARY_MODEL}")
         await save_chat_message(chat_id, "user", user_text)
         await save_chat_message(chat_id, "assistant", ai_reply)
         await memory.log_decision(trace_id, user_id, "answered_local", model_used=PRIMARY_MODEL)
@@ -565,6 +599,7 @@ async def keep_local_model_warm():
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=1,
                 timeout=30.0,  # прогрев в фоне, никто его не ждёт — можно не спешить
+                extra_body={"reasoning_effort": "none"},  # не тратим GPU-время на thinking ради пустого пинга
             )
             logging.info("[Kernel] Локальная модель прогрета (keep-alive)")
         except Exception as e:
@@ -648,7 +683,19 @@ async def main():
                     await process_event(msg_id, msg_data["data"])
                     last_id = msg_id
         except Exception as e:
-            pass
+            # Раньше здесь было пустое `pass` — если Redis моргнёт (перезапуск
+            # контейнера, сетевой сбой, ещё не поднялся при старте), ядро
+            # молча уходило в бесконечный быстрый цикл ничего-не-делания БЕЗ
+            # единой строчки в логах: процесс выглядит живым (docker ps
+            # покажет running), а по факту сообщения не обрабатываются, и
+            # никакого сигнала об этом нет — тот же класс проблемы, что и
+            # молчаливо зависавший pool.acquire() (см. POOL_ACQUIRE_TIMEOUT в
+            # memory.py), только теперь на уровне всего event-loop'а ядра.
+            # Логируем и делаем паузу подольше, чтобы не заспамить лог одной
+            # и той же ошибкой 10 раз в секунду, пока Redis не поднимется.
+            logging.error(f"[Kernel] Ошибка в главном цикле чтения stream:ingress: {e}")
+            await asyncio.sleep(2.0)
+            continue
         await asyncio.sleep(0.1)
 
 if __name__ == "__main__":

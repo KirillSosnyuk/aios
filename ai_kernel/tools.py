@@ -162,6 +162,12 @@ async def remember_preference(user_id: Optional[int], facts: Optional[list]) -> 
         if not category or not key or not value:
             errors.append(str(fact))
             continue
+        # Модель с некорректно сформированным вызовом инструмента иногда
+        # присылает не строку (например, число для value) — колонки в
+        # Postgres TEXT, а asyncpg (в отличие от psycopg2) строго проверяет
+        # соответствие типов и уронит весь вызов исключением на нестроковом
+        # аргументе вместо понятного сообщения об ошибке.
+        category, key, value = str(category), str(key), str(value)
         try:
             await _set_preference(user_id, category, key, value)
             saved.append(f"{category}/{key} = {value}")
@@ -199,6 +205,11 @@ async def add_memory_note(user_id: Optional[int], content: Optional[str], catego
     """
     if not user_id:
         return "Не удалось сохранить: пользователь не определён."
+    if not isinstance(content, str):
+        # См. аналогичную защиту в remember_preference — модель иногда
+        # присылает не строку, а .strip() ниже на не-строке уронит весь
+        # раунд инструментов исключением вместо понятного ответа.
+        content = str(content) if content is not None else ""
     if not content or not content.strip():
         return "Не удалось сохранить: пустая заметка."
 

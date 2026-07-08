@@ -208,6 +208,8 @@ async def listen_egress_stream():
                         logging.error(f"Failed to deliver event {msg_id}: {msg_err}")
         except Exception as e:
             logging.error(f"Error in egress listener: {e}")
+            await asyncio.sleep(2.0)  # не спамить лог тем же сбоем 10 раз в секунду
+            continue
         await asyncio.sleep(0.1)
 
 async def main():
