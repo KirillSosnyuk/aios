@@ -35,6 +35,10 @@ logger = logging.getLogger("aios.tools.search")
 MAX_RESULTS = 5
 MAX_RETRIES = 2          # попыток внутри ddgs-движка (реальные сетевые сбои)
 HTTP_TIMEOUT = 10        # сек на один HTTP-запрос движка
+# Потолок длины сниппета ОДНОГО результата. Бережёт токены (особенно важно для
+# облачного фолбэка под TPM-лимитом Groq): один длинный extract не должен
+# раздувать промпт. Локальной модели этого объёма тоже с запасом хватает.
+MAX_BODY_CHARS = 1000
 
 # Провайдер поиска — абстракция (спецификация §4.8 Replaceable, §21 unified API):
 # движок переключается через .env БЕЗ правки кода. Значения:
@@ -194,6 +198,8 @@ def _format_results(results: List[Dict[str, str]]) -> str:
         title = r.get("title") or "Без заголовка"
         link = r.get("href") or r.get("link") or "—"
         body = r.get("body") or "Нет описания"
+        if len(body) > MAX_BODY_CHARS:
+            body = body[:MAX_BODY_CHARS].rstrip() + "…"
         blocks.append(f"[{i}] {title}\nИсточник: {link}\n{body}")
     return "\n---\n".join(blocks)
 

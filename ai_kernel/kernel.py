@@ -46,6 +46,14 @@ logging.basicConfig(level=logging.INFO)
 local_client = AsyncOpenAI(base_url=OLLAMA_URL, api_key="ollama", max_retries=0)
 cloud_client = AsyncOpenAI(base_url=CLOUD_API_URL, api_key=CLOUD_API_KEY, max_retries=0)
 
+# Потолок на генерацию облака за один вызов. КРИТИЧНО для бесплатного Groq:
+# там лимит TPM=8000 токенов/мин, а Groq считает «запрошено» = токены промпта +
+# ЗАРЕЗЕРВИРОВАННЫЙ max_completion. Без явного max_tokens gpt-oss-120b резервирует
+# огромный бюджет вывода — в реальном инциденте 2026-07-08 запрос оценился в
+# 18924 токена (413 Payload Too Large) при промпте всего в пару тысяч. Явный
+# небольшой max_tokens убирает эту «резервацию» и удерживает запрос под лимитом.
+CLOUD_MAX_TOKENS = 1024
+
 # --- Разрешения инструментов (раздел 18 спецификации) -----------------------
 # Статическая карта вместо таблицы в БД — на этом этапе проекта инструментов
 # мало и они не меняются в рантайме; если это изменится, легко перенести в
@@ -288,6 +296,7 @@ async def handle_tool_calls(
     chat_id=None,
     timeout: float = 15.0,
     max_rounds: int = 6,
+    create_extra: Optional[dict] = None,
 ):
     """Выполняет вызовы инструментов и опрашивает модель дальше, пока она не
     даст обычный текстовый ответ (или не кончится лимит раундов max_rounds).
@@ -319,6 +328,7 @@ async def handle_tool_calls(
     одного и того же безуспешного поиска, ничего не давая взамен, и
     упиралась в TPM-лимит облака раньше, чем добиралась до финального ответа.
     """
+    create_extra = create_extra or {}  # доп. параметры create(): max_tokens и т.п.
     search_calls_used = 0
 
     for _ in range(max_rounds):
@@ -407,6 +417,7 @@ async def handle_tool_calls(
                     model=model_name,
                     messages=messages,
                     timeout=timeout,
+                    **create_extra,
                 )
             except Exception as api_err:
                 logging.warning(f"[Kernel] Финальный запрос без инструментов не удался: {api_err}")
@@ -424,6 +435,7 @@ async def handle_tool_calls(
             messages=messages,
             tools=TOOLS_MANIFEST,
             timeout=timeout,
+            **create_extra,
         )
 
         if response.choices[0].message.tool_calls:
@@ -454,22 +466,19 @@ async def _run_cloud_fallback(
     доп. раунды + связный финальный ответ) сразу отдаём облаку, не давая
     локалке тянуть это самой.
 
-    Это ключевое изменение по итогам критического разбора от 2026-07-08:
-    маленькая локальная модель регулярно не справлялась именно с
-    многораундовой работой инструментов (таймауты на втором шаге, недо-
-    извлечённые факты из длинных сообщений) — а не с самим решением, какой
-    инструмент вызвать. Раньше локалка сама пыталась это оркестровать и либо
-    таймаутилась (тратя впустую свои 8 секунд), либо путала половину фактов;
-    теперь эта работа только у облака, а локалка отвечает за две вещи: свои
-    собственные быстрые ответы без инструментов и (дёшево) выбор нужного
-    инструмента.
+    2026-07-08 (после включения надёжного Tavily): оркестровку инструментов
+    теперь СНАЧАЛА делает локальная модель на GPU (см. call_model_router) — это
+    Local First (§4.2) и §17 (если локаль справляется, облако не трогаем). Сюда,
+    в облако, попадаем в двух случаях: (1) локальная модель вообще не ответила
+    (таймаут/ошибка ещё до инструментов); (2) локальная оркестровка инструментов
+    упала и её эскалировали. Прежний режим «любой инструмент сразу в облако»
+    убран: он гонял облако даже на простом поиске и утыкался в TPM-лимит Groq.
 
-    reuse_tool_calls: если передан — решение "что вызвать" уже принято (обычно
-    локальной моделью), и мы не тратим время на то, чтобы облако решало ту же
-    задачу с нуля — сразу выполняем и продолжаем диалог с этой же историей
-    сообщений (она ещё не содержит следов локального вызова — локалка теперь
-    никогда сама не выполняет handle_tool_calls, так что messages здесь всегда
-    "чистый" [system, история, user], без риска рассинхрона).
+    reuse_tool_calls: если передан — решение "что вызвать" уже принято локальной
+    моделью, и облако не решает ту же задачу с нуля. В облако передаётся
+    канонический `messages` ([system, история, user]) — отдельный от
+    local_messages список, НЕ затронутый локальными tool-раундами, поэтому
+    рассинхрона истории нет.
     """
     decision_label = "answered_hybrid_tool_handoff" if reuse_tool_calls else "answered_cloud_fallback"
     try:
@@ -480,12 +489,14 @@ async def _run_cloud_fallback(
             ai_reply = await handle_tool_calls(
                 cloud_client, FALLBACK_MODEL, cloud_messages, reuse_tool_calls,
                 user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=20.0,
+                create_extra={"max_tokens": CLOUD_MAX_TOKENS},
             )
         else:
             response = await cloud_client.chat.completions.create(
                 model=FALLBACK_MODEL,
                 messages=cloud_messages,
                 tools=TOOLS_MANIFEST,  # Передаем плагины и в облако тоже!
+                max_tokens=CLOUD_MAX_TOKENS,
             )
 
             if response.choices[0].message.tool_calls:
@@ -493,6 +504,7 @@ async def _run_cloud_fallback(
                 ai_reply = await handle_tool_calls(
                     cloud_client, FALLBACK_MODEL, cloud_messages, response.choices[0].message.tool_calls,
                     user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=20.0,
+                    create_extra={"max_tokens": CLOUD_MAX_TOKENS},
                 )
             else:
                 ai_reply = _extract_final_reply(response, context_label=f"cloud:{FALLBACK_MODEL}")
@@ -626,20 +638,48 @@ async def call_model_router(
         )
 
         if response.choices[0].message.tool_calls:
-            # Локалка неплохо угадывает, КАКОЙ инструмент нужен — это дёшево
-            # и быстро. А вот многораундовую оркестровку (выполнить, решить,
-            # нужен ли ещё шаг, связно ответить) отдаём облаку сразу, не давая
-            # локалке тонуть в этом самой — именно здесь, а не в выборе
-            # инструмента, она регулярно не успевала или недобирала результат.
+            local_tool_calls = response.choices[0].message.tool_calls
+            # 2026-07-08 (после включения надёжного Tavily): раньше ЛЮБОЙ вызов
+            # инструмента немедленно уходил в облако — из-за этого даже простой
+            # поиск утыкался в TPM-лимит бесплатного Groq (реальный инцидент:
+            # 413 на 18924 токенах), а локальная GPU-модель, у которой лимитов
+            # по токенам нет, простаивала. Теперь оркестровку (выполнить
+            # инструмент + связно ответить) СНАЧАЛА делает локальная модель —
+            # это и есть Local First (§4.2) и §17 (если локаль справляется,
+            # облако не трогаем). Прежняя причина отдавать всё облаку —
+            # «локалка не тянет многораундовые инструменты» — во многом была
+            # следствием сломанного поиска (бесконечные пустые ретраи →
+            # таймаут); с рабочим поиском модель получает результат с первой
+            # попытки. Облако остаётся честным фолбэком: туда уходим ТОЛЬКО
+            # если локальная оркестровка упала (таймаут/сбой).
             logging.info(
                 f"[Kernel] Локальная модель запросила инструмент(ы) "
-                f"{[tc.function.name for tc in response.choices[0].message.tool_calls]} — "
-                f"передаю оркестровку сразу облаку ({FALLBACK_MODEL})"
+                f"{[tc.function.name for tc in local_tool_calls]} — выполняю ЛОКАЛЬНО "
+                f"(облако только при сбое)"
             )
-            return await _run_cloud_fallback(
-                messages, user_text, chat_id, user_id, trace_id,
-                reuse_tool_calls=response.choices[0].message.tool_calls,
-            )
+            try:
+                ai_reply = await handle_tool_calls(
+                    local_client, PRIMARY_MODEL, local_messages, local_tool_calls,
+                    user_id=user_id, trace_id=trace_id, chat_id=chat_id,
+                    timeout=LOCAL_TIMEOUT,
+                    create_extra={
+                        "max_tokens": LOCAL_MAX_TOKENS,
+                        "extra_body": {"reasoning_effort": "none"},
+                    },
+                )
+                await save_chat_message(chat_id, "user", user_text)
+                await save_chat_message(chat_id, "assistant", ai_reply)
+                await memory.log_decision(trace_id, user_id, "answered_local_tools", model_used=PRIMARY_MODEL)
+                return ai_reply
+            except Exception as local_tool_err:
+                logging.warning(
+                    f"[Kernel] Локальная оркестровка инструментов не удалась "
+                    f"({local_tool_err}) — эскалирую в облако ({FALLBACK_MODEL})"
+                )
+                return await _run_cloud_fallback(
+                    messages, user_text, chat_id, user_id, trace_id,
+                    reuse_tool_calls=local_tool_calls,
+                )
 
         ai_reply = _extract_final_reply(response, context_label=f"local:{PRIMARY_MODEL}")
         await save_chat_message(chat_id, "user", user_text)
