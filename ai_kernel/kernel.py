@@ -557,6 +557,9 @@ _STRONG_PUBLIC = (
     "курс евро", "сколько стоит", "кто такой", "кто такая", "что такое",
     "когда состо", "когда будет", "где наход", "президент", "выбор", "столица",
     "объясни", "сравни", "проанализируй", "как работает",
+    # киберспорт/игры и прочие публичные темы (частый кейс пользователя)
+    "состав", "ростер", "roster", "кс2", "cs2", "dota", "киберспорт",
+    "counter-strike", "текущий состав", "актуальн",
 )
 # 3) СЛАБО ЛИЧНОЕ — локально, если рядом притяжательное «мо…» / «у меня».
 _POSSESSIVE = (
@@ -623,8 +626,8 @@ async def _answer_on_cloud(
 
     ЗАЗЕМЛЕНИЕ: чтобы облако не выдумывало и не опиралось на устаревшую
     train-память (ровно на этом спотыкалась локалка — «не пошла искать»), поиск
-    выполняем САМИ в коде и кладём результат в контекст. Инструмент поиска модели
-    тоже доступен, если захочет доуточнить.
+    выполняем САМИ в коде и кладём результат в контекст. Инструменты облаку НЕ
+    передаём вовсе — так физически исключён 400 «tool not in request.tools».
 
     Возвращает строку-ответ или None, если облако недоступно (квота/сбой) —
     тогда вызывающий делает локальный фолбэк (вопрос-то публичный).
@@ -641,27 +644,25 @@ async def _answer_on_cloud(
             + safe_history
             + [{"role": "user", "content": user_text}]
             + [{"role": "system", "content": (
-                "Актуальные результаты веб-поиска по вопросу пользователя — "
-                "опирайся на них, не выдумывай сверх них:\n" + search_results)}]
+                "Актуальные результаты веб-поиска по вопросу пользователя ниже. "
+                "Опирайся ТОЛЬКО на них, не выдумывай сверх них. Ответь обычным "
+                "текстом на русском языке и НЕ вызывай никаких инструментов:\n"
+                + search_results)}]
         )
 
         await _publish_status(chat_id, trace_id, f"Отвечаю через облако ({FALLBACK_MODEL})…")
+        # tools НЕ передаём: поиск уже выполнен, результаты в контексте. Это
+        # полностью исключает 400 «tool ... not in request.tools» (Groq строго
+        # валидирует любой вызов инструмента, а gpt-oss по инерции системного
+        # промпта иногда пытается вызвать remember_preference, которого в облачном
+        # режиме нет — реальный инцидент 2026-07-08). Облако здесь только
+        # СИНТЕЗИРУЕТ ответ по выдаче, а не оркеструет инструменты.
         response = await cloud_client.chat.completions.create(
             model=FALLBACK_MODEL,
             messages=cloud_messages,
-            tools=SEARCH_ONLY_MANIFEST,  # только поиск: память в облако НЕ даём (приватность)
             max_tokens=CLOUD_MAX_TOKENS,
         )
-        if response.choices[0].message.tool_calls:
-            ai_reply = await handle_tool_calls(
-                cloud_client, FALLBACK_MODEL, cloud_messages,
-                response.choices[0].message.tool_calls,
-                user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=20.0,
-                create_extra={"max_tokens": CLOUD_MAX_TOKENS},
-                tools_manifest=SEARCH_ONLY_MANIFEST,
-            )
-        else:
-            ai_reply = _extract_final_reply(response, context_label=f"cloud:{FALLBACK_MODEL}")
+        ai_reply = _extract_final_reply(response, context_label=f"cloud:{FALLBACK_MODEL}")
 
         await save_chat_message(chat_id, "user", user_text)
         await save_chat_message(chat_id, "assistant", ai_reply)
