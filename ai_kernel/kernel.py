@@ -72,6 +72,10 @@ TOOL_PERMISSION_LEVELS = {
 # требовать подтверждения, пока её явно не пометят безопасной, а не наоборот.
 DEFAULT_PERMISSION_LEVEL = 2  # для инструментов, не описанных явно выше — блокируется (см. MAX_AUTO_PERMISSION_LEVEL)
 
+# Манифест ТОЛЬКО с поиском — для облачного пути: инструменты памяти в облако не
+# отдаём (приватность), там модели доступен лишь веб-поиск.
+SEARCH_ONLY_MANIFEST = [t for t in TOOLS_MANIFEST if t["function"]["name"] == "search_web"]
+
 # 2026-07-08: жёсткий потолок на число обращений к search_web ЗА ОДИН ход
 # пользователя (через все раунды handle_tool_calls вместе, не за раунд).
 # Раньше это регулировалось только текстовой инструкцией в system_prompt
@@ -149,7 +153,7 @@ LOCAL_TOOLS_MAX_TOKENS = 1200
 # не быстрее. Как только будут реальные цифры токенов/сек с этого железа
 # (см. `ollama run qwen3:8b --verbose`), таймаут стоит пересчитать осмысленно,
 # а не подбирать вслепую ещё раз.
-LOCAL_TIMEOUT = 25.0
+LOCAL_TIMEOUT = 30.0  # 2026-07-08: поднято 25→30 на время разработки (по просьбе)
 LOCAL_BREVITY_SUFFIX = (
     "\n\n/no_think\n"  # Явный текстовый переключатель Qwen3 — дублирует ниже extra_body
     "ТЫ СЕЙЧАС РАБОТАЕШЬ КАК БЫСТРАЯ ЛОКАЛЬНАЯ МОДЕЛЬ: отвечай МАКСИМАЛЬНО "
@@ -365,6 +369,7 @@ async def handle_tool_calls(
     timeout: float = 15.0,
     max_rounds: int = 6,
     create_extra: Optional[dict] = None,
+    tools_manifest: Optional[list] = None,
 ):
     """Выполняет вызовы инструментов и опрашивает модель дальше, пока она не
     даст обычный текстовый ответ (или не кончится лимит раундов max_rounds).
@@ -397,6 +402,7 @@ async def handle_tool_calls(
     упиралась в TPM-лимит облака раньше, чем добиралась до финального ответа.
     """
     create_extra = create_extra or {}  # доп. параметры create(): max_tokens и т.п.
+    tools_manifest = tools_manifest or TOOLS_MANIFEST  # облако передаёт SEARCH_ONLY_MANIFEST
     search_calls_used = 0
 
     for _ in range(max_rounds):
@@ -501,7 +507,7 @@ async def handle_tool_calls(
         response = await client.chat.completions.create(
             model=model_name,
             messages=messages,
-            tools=TOOLS_MANIFEST,
+            tools=tools_manifest,
             timeout=timeout,
             **create_extra,
         )
@@ -520,62 +526,142 @@ async def handle_tool_calls(
     return "Не получилось собрать окончательный ответ за разумное число шагов — попробуй переформулировать запрос или отправить его покороче."
 
 
-async def _run_cloud_fallback(
-    cloud_messages: list,
+# ==========================================================================
+# ПРИВАТНОСТЬ-ОСОЗНАННЫЙ РОУТЕР (спецификация §17 — выбор модели по факторам,
+# в т.ч. ПРИВАТНОСТЬ). Главный принцип проекта: конфиденциальные личные данные
+# НИКОГДА не уходят в облако. Поэтому маршрут решаем МЫ детерминированной
+# эвристикой (а не сама модель — так решение быстрое, не утекает наружу и видно
+# в журнале), и делаем это КОНСЕРВАТИВНО:
+#   • по умолчанию — ЛОКАЛЬНО;
+#   • в ОБЛАКО уходят только явно ПУБЛИЧНЫЕ фактические вопросы без личных данных;
+#   • всё, что похоже на личное/память, — жёстко локально.
+# Ошибка «локально вместо облака» = просто хуже качество (но приватно). Ошибка
+# «в облако вместо локального» = утечка. Поэтому список облачных триггеров узкий,
+# личных — широкий, дефолт локальный. Это v1: списки-константы легко дополнять,
+# каждое решение пишется в audit (route_decided); позже можно заменить локальным
+# классификатором.
+
+# 1) СИЛЬНО ЛИЧНОЕ — всегда локально, важнее любых прочих признаков.
+_STRONG_PRIVATE = (
+    "напомни", "запомни", "обо мне", "про меня", "что я говорил", "мои данные",
+    "мой профиль", "пароль", "паспорт", "снилс", " инн", "банковск", "мой счёт",
+    "на счету", "зарплат", "кредит", "ипотек", "лекарств", "болезн", "диагноз",
+    "диабет", "симптом", "переписк", "мои сообщени", "мой адрес", "мой телефон",
+    "мой номер", "моя карта", "мои финанс", "личные данные", "личных данных",
+)
+# 2) СИЛЬНО ПУБЛИЧНОЕ — можно в облако (проверяется ПОСЛЕ сильно-личного).
+_STRONG_PUBLIC = (
+    "кто выиграл", "кто победил", "кто чемпион", "результат матч", "счёт матч",
+    "матч", "матче", "чемпионат", "турнир", "олимпиад", "лига", "плей-офф",
+    "на каком этапе", "новост", "погод", "курс валют", "курс доллар",
+    "курс евро", "сколько стоит", "кто такой", "кто такая", "что такое",
+    "когда состо", "когда будет", "где наход", "президент", "выбор", "столица",
+    "объясни", "сравни", "проанализируй", "как работает",
+)
+# 3) СЛАБО ЛИЧНОЕ — локально, если рядом притяжательное «мо…» / «у меня».
+_POSSESSIVE = (
+    "мой ", "моя ", "моё ", "мои ", "моей", "моего", "моих", "моим", "мною",
+    "у меня", "мне ", "меня ",
+)
+_WEAK_PERSONAL_DOMAIN = (
+    "дом", "семь", "жена", "муж", "дети", "ребён", "сын", "дочь", "родит",
+    "работ", "задач", "встреч", "календар", "расписани", "деньг", "здоров",
+    "врач", "почт", "письмо", "квартир", "комнат", "устройств", "коллег",
+)
+
+_ALL_FAILED_MSG = (
+    "Извини, и локальная, и облачная модели сейчас недоступны. "
+    "Попробуй ещё раз чуть позже."
+)
+_LOCAL_FAILED_PRIVATE_MSG = (
+    "Локальная модель сейчас не отвечает, а запрос затрагивает личные данные — "
+    "в облако я его не отправляю ради конфиденциальности. Попробуй чуть позже."
+)
+
+
+def is_sensitive_text(text: Optional[str]) -> bool:
+    """Груба, но КОНСЕРВАТИВНА: True, если текст похож на личный/конфиденциальный.
+    Используется и для маршрутизации, и для фильтрации истории перед облаком."""
+    if not text:
+        return False
+    t = text.lower()
+    if any(m in t for m in _STRONG_PRIVATE):
+        return True
+    if any(p in t for p in _POSSESSIVE) and any(d in t for d in _WEAK_PERSONAL_DOMAIN):
+        return True
+    return False
+
+
+def decide_route(user_text: str):
+    """Решаем МЫ, куда отправить запрос: (target, sensitive, reason).
+    Порядок проверок задаёт приоритет приватности (см. большой комментарий)."""
+    t = (user_text or "").lower()
+    if any(m in t for m in _STRONG_PRIVATE):
+        return ("local", True, "личные/конфиденциальные данные → строго локально")
+    if any(m in t for m in _STRONG_PUBLIC):
+        return ("cloud", False, "публичный фактический вопрос → облако (качество)")
+    if any(p in t for p in _POSSESSIVE) and any(d in t for d in _WEAK_PERSONAL_DOMAIN):
+        return ("local", True, "личный контекст (притяжательное + личная тема) → локально")
+    return ("local", False, "по умолчанию → локально (приватность)")
+
+
+async def _answer_on_cloud(
     user_text: str,
     chat_id: str,
     user_id: Optional[int],
     trace_id: Optional[str],
-    reuse_tool_calls=None,
-):
-    """Единая точка облачного пути. Вызывается в двух случаях: (1) локальная
-    модель вообще не ответила (таймаут/ошибка), (2) локальная модель ответила
-    и запросила инструмент, но саму оркестровку (выполнение + возможные
-    доп. раунды + связный финальный ответ) сразу отдаём облаку, не давая
-    локалке тянуть это самой.
+    history: list,
+    clean_system_prompt: str,
+    decision_label: str = "answered_cloud_routed",
+) -> Optional[str]:
+    """Облачный путь — ТОЛЬКО для несекретных публичных вопросов (см. decide_route).
 
-    2026-07-08 (после включения надёжного Tavily): оркестровку инструментов
-    теперь СНАЧАЛА делает локальная модель на GPU (см. call_model_router) — это
-    Local First (§4.2) и §17 (если локаль справляется, облако не трогаем). Сюда,
-    в облако, попадаем в двух случаях: (1) локальная модель вообще не ответила
-    (таймаут/ошибка ещё до инструментов); (2) локальная оркестровка инструментов
-    упала и её эскалировали. Прежний режим «любой инструмент сразу в облако»
-    убран: он гонял облако даже на простом поиске и утыкался в TPM-лимит Groq.
+    ПРИВАТНОСТЬ: сюда НИКОГДА не передаётся профиль пользователя
+    (build_profile_blurb), а из истории вырезаются «личные» сообщения
+    (is_sensitive_text) — в облако уходит лишь публичный контекст. Инструменты
+    памяти в облако тоже не даём (SEARCH_ONLY_MANIFEST).
 
-    reuse_tool_calls: если передан — решение "что вызвать" уже принято локальной
-    моделью, и облако не решает ту же задачу с нуля. В облако передаётся
-    канонический `messages` ([system, история, user]) — отдельный от
-    local_messages список, НЕ затронутый локальными tool-раундами, поэтому
-    рассинхрона истории нет.
+    ЗАЗЕМЛЕНИЕ: чтобы облако не выдумывало и не опиралось на устаревшую
+    train-память (ровно на этом спотыкалась локалка — «не пошла искать»), поиск
+    выполняем САМИ в коде и кладём результат в контекст. Инструмент поиска модели
+    тоже доступен, если захочет доуточнить.
+
+    Возвращает строку-ответ или None, если облако недоступно (квота/сбой) —
+    тогда вызывающий делает локальный фолбэк (вопрос-то публичный).
     """
-    decision_label = "answered_hybrid_tool_handoff" if reuse_tool_calls else "answered_cloud_fallback"
     try:
-        logging.info(f"Using Cloud Model: {FALLBACK_MODEL}")
-        await _publish_status(chat_id, trace_id, f"Подключаю облачную модель ({FALLBACK_MODEL})…")
+        logging.info(f"[Kernel] Маршрут: ОБЛАКО ({FALLBACK_MODEL}) — публичный вопрос")
+        await _publish_status(chat_id, trace_id, "Ищу актуальную информацию…")
 
-        if reuse_tool_calls:
+        safe_history = [m for m in history if not is_sensitive_text(m.get("content"))]
+        search_results = await search_web(user_text)
+
+        cloud_messages = (
+            [{"role": "system", "content": clean_system_prompt}]
+            + safe_history
+            + [{"role": "user", "content": user_text}]
+            + [{"role": "system", "content": (
+                "Актуальные результаты веб-поиска по вопросу пользователя — "
+                "опирайся на них, не выдумывай сверх них:\n" + search_results)}]
+        )
+
+        await _publish_status(chat_id, trace_id, f"Отвечаю через облако ({FALLBACK_MODEL})…")
+        response = await cloud_client.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=cloud_messages,
+            tools=SEARCH_ONLY_MANIFEST,  # только поиск: память в облако НЕ даём (приватность)
+            max_tokens=CLOUD_MAX_TOKENS,
+        )
+        if response.choices[0].message.tool_calls:
             ai_reply = await handle_tool_calls(
-                cloud_client, FALLBACK_MODEL, cloud_messages, reuse_tool_calls,
+                cloud_client, FALLBACK_MODEL, cloud_messages,
+                response.choices[0].message.tool_calls,
                 user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=20.0,
                 create_extra={"max_tokens": CLOUD_MAX_TOKENS},
+                tools_manifest=SEARCH_ONLY_MANIFEST,
             )
         else:
-            response = await cloud_client.chat.completions.create(
-                model=FALLBACK_MODEL,
-                messages=cloud_messages,
-                tools=TOOLS_MANIFEST,  # Передаем плагины и в облако тоже!
-                max_tokens=CLOUD_MAX_TOKENS,
-            )
-
-            if response.choices[0].message.tool_calls:
-                logging.info(f"[Kernel] Облако запросило вызов инструментов: {response.choices[0].message.tool_calls}")
-                ai_reply = await handle_tool_calls(
-                    cloud_client, FALLBACK_MODEL, cloud_messages, response.choices[0].message.tool_calls,
-                    user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=20.0,
-                    create_extra={"max_tokens": CLOUD_MAX_TOKENS},
-                )
-            else:
-                ai_reply = _extract_final_reply(response, context_label=f"cloud:{FALLBACK_MODEL}")
+            ai_reply = _extract_final_reply(response, context_label=f"cloud:{FALLBACK_MODEL}")
 
         await save_chat_message(chat_id, "user", user_text)
         await save_chat_message(chat_id, "assistant", ai_reply)
@@ -583,25 +669,99 @@ async def _run_cloud_fallback(
         return ai_reply
 
     except RateLimitError as cloud_err:
-        # Отдельно от прочих ошибок: это не "не достучались", а упёрлись в
-        # квоту/лимит запросов облачного провайдера. Ретраить бессмысленно —
-        # квота не появится за секунды.
-        logging.error(f"Cloud model rate-limited or quota exceeded: {cloud_err}")
+        logging.error(f"[Kernel] Облако упёрлось в лимит: {cloud_err}")
         await memory.log_decision(
             trace_id, user_id, "cloud_rate_limited",
             model_used=FALLBACK_MODEL, details={"error": str(cloud_err)},
         )
-        return (
-            f"ИИ временно недоступен: облачная модель ({FALLBACK_MODEL}) упёрлась в лимит "
-            "запросов. Попробуй чуть позже — лимит обычно сбрасывается в течение суток."
-        )
+        return None
     except Exception as cloud_err:
-        logging.error(f"All models failed: {cloud_err}")
+        logging.error(f"[Kernel] Облачный путь не удался: {cloud_err}")
         await memory.log_decision(
-            trace_id, user_id, "all_models_failed",
-            details={"error": str(cloud_err)},
+            trace_id, user_id, "cloud_failed", details={"error": str(cloud_err)},
         )
-        return "Извини, произошла ошибка соединения с ИИ-модулями."
+        return None
+
+
+async def _answer_on_local(
+    user_text: str,
+    chat_id: str,
+    user_id: Optional[int],
+    trace_id: Optional[str],
+    history: list,
+    full_system_prompt: str,
+    allow_cloud: bool,
+    clean_system_prompt: Optional[str] = None,
+) -> str:
+    """Локальный путь: полный контекст (профиль + все инструменты) + оркестровка.
+
+    allow_cloud=False для СЕКРЕТНЫХ запросов — при сбое НЕ эскалируем в облако
+    (конфиденциальность важнее ответа), отдаём понятную ошибку.
+    """
+    local_messages = (
+        [{"role": "system", "content": full_system_prompt + LOCAL_BREVITY_SUFFIX}]
+        + history + [{"role": "user", "content": user_text}]
+    )
+
+    async def _escalate_or_fail() -> str:
+        if allow_cloud and clean_system_prompt is not None:
+            cloud_reply = await _answer_on_cloud(
+                user_text, chat_id, user_id, trace_id, history, clean_system_prompt,
+                decision_label="answered_cloud_after_local_fail",
+            )
+            if cloud_reply is not None:
+                return cloud_reply
+            return _ALL_FAILED_MSG
+        await memory.log_decision(
+            trace_id, user_id, "local_failed_no_cloud",
+            model_used=PRIMARY_MODEL, details={"sensitive": not allow_cloud},
+        )
+        return _LOCAL_FAILED_PRIVATE_MSG if not allow_cloud else _ALL_FAILED_MSG
+
+    try:
+        logging.info(f"[Kernel] Маршрут: ЛОКАЛЬНО ({PRIMARY_MODEL})")
+        await _publish_status(chat_id, trace_id, f"Думаю (локальная модель {PRIMARY_MODEL})…")
+        response = await local_client.chat.completions.create(
+            model=PRIMARY_MODEL,
+            messages=local_messages,
+            tools=TOOLS_MANIFEST,
+            timeout=LOCAL_TIMEOUT,
+            max_tokens=LOCAL_MAX_TOKENS,
+            extra_body={"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}},
+        )
+
+        if response.choices[0].message.tool_calls:
+            local_tool_calls = response.choices[0].message.tool_calls
+            logging.info(
+                f"[Kernel] Локальная модель запросила инструмент(ы) "
+                f"{[tc.function.name for tc in local_tool_calls]} — выполняю ЛОКАЛЬНО"
+            )
+            try:
+                ai_reply = await handle_tool_calls(
+                    local_client, PRIMARY_MODEL, local_messages, local_tool_calls,
+                    user_id=user_id, trace_id=trace_id, chat_id=chat_id, timeout=LOCAL_TIMEOUT,
+                    create_extra={
+                        "max_tokens": LOCAL_TOOLS_MAX_TOKENS,
+                        "extra_body": {"reasoning_effort": "none"},
+                    },
+                )
+                await save_chat_message(chat_id, "user", user_text)
+                await save_chat_message(chat_id, "assistant", ai_reply)
+                await memory.log_decision(trace_id, user_id, "answered_local_tools", model_used=PRIMARY_MODEL)
+                return ai_reply
+            except Exception as local_tool_err:
+                logging.warning(f"[Kernel] Локальная оркестровка не удалась ({local_tool_err})")
+                return await _escalate_or_fail()
+
+        ai_reply = _extract_final_reply(response, context_label=f"local:{PRIMARY_MODEL}")
+        await save_chat_message(chat_id, "user", user_text)
+        await save_chat_message(chat_id, "assistant", ai_reply)
+        await memory.log_decision(trace_id, user_id, "answered_local", model_used=PRIMARY_MODEL)
+        return ai_reply
+
+    except Exception as e:
+        logging.warning(f"[Kernel] Локальная модель не ответила: {e}")
+        return await _escalate_or_fail()
 
 
 async def call_model_router(
@@ -670,101 +830,46 @@ async def call_model_router(
         "текстом, как будто говоришь вслух — короткими абзацами. Несколько "
         "вариантов перечисляй прямо в тексте («во-первых… во-вторых…» или через "
         "запятую), а не списком или таблицей.\n"
-        f"{profile_blurb}"
     )
+    # system_prompt выше — БАЗОВЫЙ (без личного профиля). Профиль добавляем
+    # только для ЛОКАЛЬНОГО пути; в облако уходит чистая версия — приватность.
+    clean_system_prompt = system_prompt
+    full_system_prompt = system_prompt + profile_blurb
 
     history = await get_chat_history(chat_id)
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_text}]
-    # Локальная модель получает тот же system_prompt плюс отдельное указание
-    # быть краткой (см. LOCAL_BREVITY_SUFFIX) — это НЕ просачивается в облако:
-    # если дело дойдёт до _run_cloud_fallback, туда уходит канонический
-    # `messages` без суффикса, а не local_messages.
-    local_messages = [{"role": "system", "content": system_prompt + LOCAL_BREVITY_SUFFIX}] + history + [{"role": "user", "content": user_text}]
 
-    # Попытка 1: Локальная модель — быстрый путь для простых ответов без инструментов.
-    try:
-        logging.info(f"Using Primary Local Model: {PRIMARY_MODEL}")
-        await _publish_status(chat_id, trace_id, f"Думаю (локальная модель {PRIMARY_MODEL})…")
-        response = await local_client.chat.completions.create(
-            model=PRIMARY_MODEL,
-            messages=local_messages,
-            tools=TOOLS_MANIFEST,  # Передаем описание наших навыков
-            timeout=LOCAL_TIMEOUT,
-            max_tokens=LOCAL_MAX_TOKENS,
-            # Qwen3 — гибридная "thinking"-модель: по умолчанию перед ЛЮБЫМ
-            # ответом (даже простым решением "вызвать ли инструмент") генерит
-            # видимую цепочку рассуждений, которая ничего не даёт для такой
-            # простой задачи, но заметно удлиняет ответ и ест бюджет
-            # LOCAL_MAX_TOKENS ещё до видимого ответа.
-            # 2026-07-08, ревизия 2: chat_template_kwargs.enable_thinking — это
-            # параметр НАТИВНОГО шаблона Qwen3 (как его понимают vLLM/
-            # transformers), а OpenAI-совместимый эндпоинт Ollama на него
-            # вообще не смотрит — то есть эта строка, скорее всего, никогда не
-            # работала. Официально задокументированный способ (проверено по
-            # исходникам Ollama: github.com/ollama/ollama/issues/14820 и
-            # docs.ollama.com/api/openai-compatibility) — поле reasoning_effort:
-            # "none". Оставляем оба варианта одновременно: reasoning_effort как
-            # реально рабочий механизм, chat_template_kwargs — как безвредный
-            # запасной на случай других провайдеров, которые всё же его учитывают.
-            extra_body={
-                "reasoning_effort": "none",
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+    # РОУТЕР: решаем МЫ, локально или в облако (приоритет — приватность, §17).
+    target, sensitive, reason = decide_route(user_text)
+    logging.info(f"[Kernel] Роутер → {target}: {reason}")
+    await _publish_status(chat_id, trace_id, f"Маршрут: {'облако' if target == 'cloud' else 'локально'} — {reason}")
+    await memory.log_decision(
+        trace_id, user_id, "route_decided",
+        details={"target": target, "sensitive": sensitive, "reason": reason},
+    )
+
+    if target == "cloud":
+        reply = await _answer_on_cloud(
+            user_text, chat_id, user_id, trace_id, history, clean_system_prompt
+        )
+        if reply is not None:
+            return reply
+        # Облако недоступно, но вопрос ПУБЛИЧНЫЙ — отвечаем локально (лучше, чем ничего).
+        logging.warning("[Kernel] Облако недоступно на публичном вопросе — локальный фолбэк")
+        return await _answer_on_local(
+            user_text, chat_id, user_id, trace_id, history,
+            full_system_prompt, allow_cloud=False,
         )
 
-        if response.choices[0].message.tool_calls:
-            local_tool_calls = response.choices[0].message.tool_calls
-            # 2026-07-08 (после включения надёжного Tavily): раньше ЛЮБОЙ вызов
-            # инструмента немедленно уходил в облако — из-за этого даже простой
-            # поиск утыкался в TPM-лимит бесплатного Groq (реальный инцидент:
-            # 413 на 18924 токенах), а локальная GPU-модель, у которой лимитов
-            # по токенам нет, простаивала. Теперь оркестровку (выполнить
-            # инструмент + связно ответить) СНАЧАЛА делает локальная модель —
-            # это и есть Local First (§4.2) и §17 (если локаль справляется,
-            # облако не трогаем). Прежняя причина отдавать всё облаку —
-            # «локалка не тянет многораундовые инструменты» — во многом была
-            # следствием сломанного поиска (бесконечные пустые ретраи →
-            # таймаут); с рабочим поиском модель получает результат с первой
-            # попытки. Облако остаётся честным фолбэком: туда уходим ТОЛЬКО
-            # если локальная оркестровка упала (таймаут/сбой).
-            logging.info(
-                f"[Kernel] Локальная модель запросила инструмент(ы) "
-                f"{[tc.function.name for tc in local_tool_calls]} — выполняю ЛОКАЛЬНО "
-                f"(облако только при сбое)"
-            )
-            try:
-                ai_reply = await handle_tool_calls(
-                    local_client, PRIMARY_MODEL, local_messages, local_tool_calls,
-                    user_id=user_id, trace_id=trace_id, chat_id=chat_id,
-                    timeout=LOCAL_TIMEOUT,
-                    create_extra={
-                        "max_tokens": LOCAL_TOOLS_MAX_TOKENS,
-                        "extra_body": {"reasoning_effort": "none"},
-                    },
-                )
-                await save_chat_message(chat_id, "user", user_text)
-                await save_chat_message(chat_id, "assistant", ai_reply)
-                await memory.log_decision(trace_id, user_id, "answered_local_tools", model_used=PRIMARY_MODEL)
-                return ai_reply
-            except Exception as local_tool_err:
-                logging.warning(
-                    f"[Kernel] Локальная оркестровка инструментов не удалась "
-                    f"({local_tool_err}) — эскалирую в облако ({FALLBACK_MODEL})"
-                )
-                return await _run_cloud_fallback(
-                    messages, user_text, chat_id, user_id, trace_id,
-                    reuse_tool_calls=local_tool_calls,
-                )
+    # Локальный маршрут. allow_cloud=False для СЕКРЕТНЫХ запросов — они НИКОГДА
+    # не уходят в облако даже при сбое локальной модели.
+    return await _answer_on_local(
+        user_text, chat_id, user_id, trace_id, history,
+        full_system_prompt, allow_cloud=(not sensitive),
+        clean_system_prompt=clean_system_prompt,
+    )
 
-        ai_reply = _extract_final_reply(response, context_label=f"local:{PRIMARY_MODEL}")
-        await save_chat_message(chat_id, "user", user_text)
-        await save_chat_message(chat_id, "assistant", ai_reply)
-        await memory.log_decision(trace_id, user_id, "answered_local", model_used=PRIMARY_MODEL)
-        return ai_reply
-
-    except Exception as e:
-        logging.warning(f"Local model skipped, slow or failed: {e}. Routing to Cloud API...")
-        return await _run_cloud_fallback(messages, user_text, chat_id, user_id, trace_id)
+    # (Старый линейный локальный путь удалён — вся логика перенесена в
+    # _answer_on_local и _answer_on_cloud выше, а выбор между ними — в decide_route.)
 
 async def keep_local_model_warm():
     """Держит локальную модель постоянно загруженной в Ollama.
